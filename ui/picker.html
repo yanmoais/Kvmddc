@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>选择目标主机</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body class="picker-body">
+  <div class="picker-stage" id="picker-stage">
+    <div class="picker-card mac-popover" role="listbox" aria-label="切换目标电脑">
+      <div class="picker-header">
+        <span>松开 Ctrl 切入目标主机</span>
+        <kbd class="tray-kbd">Esc</kbd>
+      </div>
+      <div class="picker-list" id="picker-list"></div>
+    </div>
+  </div>
+  <script src="./picker.js"></script>
+</body>
+</html>

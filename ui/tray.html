@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kvmddc 控制中心</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body class="tray-body">
+  <main class="tray-panel mac-popover" aria-label="Kvmddc 菜单栏控制中心">
+    <header class="tray-header">
+      <div class="tray-title-group">
+        <span class="tray-display-icon" aria-hidden="true">
+          <svg class="icon-17" viewBox="0 0 24 24">
+            <rect x="2.2" y="3.5" width="14.6" height="10.2" rx="2" />
+            <path d="M6.8 17.2h5.4M9.5 13.7v3.5" />
+            <rect x="10.4" y="10.2" width="11.2" height="7.4" rx="1.6" />
+            <path d="M9.4 20.2h13.2" />
+          </svg>
+        </span>
+        <div class="tray-title-stack">
+          <span class="tray-title" id="trayMonitorTitle">飞利浦 27E2N6900RW</span>
+          <span class="tray-subtitle tabular-nums">
+            <span class="status-dot is-green" id="trayStatusDot" aria-hidden="true"></span>
+            <span id="trayStatusText">已同步 · USB-C 5K 75Hz</span>
+          </span>
+        </div>
+      </div>
+
+      <button type="button" class="mac-push-btn" id="btnOpenStage">主舞台</button>
+    </header>
+
+    <div class="tray-perm-bar" id="trayPermBar" hidden>
+      <span class="tray-perm-left">
+        <span class="status-dot is-amber" aria-hidden="true"></span>
+        <span class="tray-perm-text">键鼠需辅助功能授权</span>
+      </span>
+      <span class="tray-perm-btns">
+        <button type="button" class="alert-retry-btn" id="trayPermOpenBtn">去开启</button>
+        <button type="button" class="alert-retry-btn" id="trayPermRestartBtn">重新检测</button>
+      </span>
+    </div>
+
+    <div class="tray-sep" aria-hidden="true"></div>
+
+    <section class="tray-host-list" id="trayHostList" aria-label="显示器信号源切换"></section>
+
+    <div class="tray-sep" aria-hidden="true"></div>
+
+    <section class="tray-brightness-row" aria-label="显示器硬件亮度">
+      <svg class="icon-14 muted-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="12" cy="12" r="4.2" />
+        <path d="M12 2.5v2.4M12 19.1v2.4M4.9 4.9l1.7 1.7M17.4 17.4l1.7 1.7M2.5 12h2.4M19.1 12h2.4M4.9 19.1l1.7-1.7M17.4 6.6l1.7-1.7" />
+      </svg>
+      <div class="chiclet-slider tray-chiclet" id="traySlider" role="slider" tabindex="0" aria-label="主显示器硬件亮度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="85"></div>
+      <span class="slider-readout tabular-nums" id="trayBrightnessPct">85%</span>
+    </section>
+
+    <section class="tray-brightness-row" aria-label="显示器硬件音量">
+      <button type="button" class="crown-mute-btn" id="trayMuteBtn" aria-pressed="false" aria-label="切换显示器静音" title="切换显示器静音">
+        <svg class="icon-14" id="trayMuteIcon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M11 5L6.5 9H3.5v6h3L11 19V5Z" />
+          <path d="M15.5 8.8a4.8 4.8 0 0 1 0 6.4M18.6 6.2a8.5 8.5 0 0 1 0 11.6" />
+        </svg>
+      </button>
+      <div class="chiclet-slider tray-chiclet" id="trayVolSlider" role="slider" tabindex="0" aria-label="主显示器硬件音量" aria-valuemin="0" aria-valuemax="100" aria-valuenow="75"></div>
+      <span class="slider-readout tabular-nums" id="trayVolumePct">75%</span>
+    </section>
+
+    <div class="tray-sep" aria-hidden="true"></div>
+
+    <section class="tray-controls-list" aria-label="跨屏与键鼠路由">
+      <button type="button" class="mac-form-row mac-switch-row" id="trayDeskflowSwitch" role="switch" aria-checked="true">
+        <span class="mac-row-label">键鼠跨屏守护</span>
+        <span class="mac-switch" aria-hidden="true"><span class="mac-switch-thumb"></span></span>
+      </button>
+
+      <button type="button" class="mac-form-row mac-switch-row" id="traySlideSwitch" role="switch" aria-checked="true">
+        <span class="mac-row-label">右滑进笔记本屏</span>
+        <span class="mac-switch" aria-hidden="true"><span class="mac-switch-thumb"></span></span>
+      </button>
+
+      <button type="button" class="mac-form-row mac-switch-row" id="trayCtrlEdgeSwitch" role="switch" aria-checked="true">
+        <span class="mac-row-label">按 Ctrl 切主屏</span>
+        <span class="mac-switch" aria-hidden="true"><span class="mac-switch-thumb"></span></span>
+      </button>
+
+      <button type="button" class="mac-form-row mac-switch-row" id="trayModSwitch" role="switch" aria-checked="true">
+        <span class="mac-row-label">⌘/Ctrl 跨机对齐</span>
+        <span class="mac-switch" aria-hidden="true"><span class="mac-switch-thumb"></span></span>
+      </button>
+
+      <div class="mac-form-row">
+        <span class="mac-row-label">显示模式</span>
+        <button type="button" class="mac-popup-btn" id="trayModeBtn" aria-haspopup="listbox" aria-expanded="false">
+          <span class="tabular-nums" id="trayModeLabel">2560×1440 · HiDPI</span>
+          <span class="mac-popup-chevrons" aria-hidden="true">
+            <svg viewBox="0 0 8 12"><path d="M1.5 4.2L4 1.7l2.5 2.5M1.5 7.8L4 10.3l2.5-2.5" /></svg>
+          </span>
+        </button>
+      </div>
+
+      <div class="mac-form-row">
+        <span class="mac-row-label">色温记忆</span>
+        <button type="button" class="mac-popup-btn" id="trayColorBtn" aria-haspopup="listbox" aria-expanded="false">
+          <span class="tabular-nums" id="trayColorLabel">6500K 标准</span>
+          <span class="mac-popup-chevrons" aria-hidden="true">
+            <svg viewBox="0 0 8 12"><path d="M1.5 4.2L4 1.7l2.5 2.5M1.5 7.8L4 10.3l2.5-2.5" /></svg>
+          </span>
+        </button>
+      </div>
+
+      <div class="mac-form-row">
+        <span class="mac-row-label">键鼠直连源</span>
+        <button type="button" class="mac-popup-btn" id="trayProviderBtn" aria-haspopup="listbox" aria-expanded="false">
+          <span class="tabular-nums" id="trayProviderLabel">Windows 直连</span>
+          <span class="mac-popup-chevrons" aria-hidden="true">
+            <svg viewBox="0 0 8 12"><path d="M1.5 4.2L4 1.7l2.5 2.5M1.5 7.8L4 10.3l2.5-2.5" /></svg>
+          </span>
+        </button>
+      </div>
+    </section>
+
+    <section class="tray-actions-grid" aria-label="显示器快捷操作">
+      <button type="button" class="mac-push-btn tray-action-btn" id="traySleepBtn">
+        <svg class="icon-13" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M20.4 14.2A8.4 8.4 0 0 1 9.8 3.6a8.4 8.4 0 1 0 10.6 10.6Z" />
+        </svg>
+        <span>熄屏待机</span>
+      </button>
+
+      <button type="button" class="mac-push-btn tray-action-btn" id="trayLeaveBtn">
+        <svg class="icon-13" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 12h11M11 8l4 4-4 4M19 5v14" />
+        </svg>
+        <span>离桌让屏</span>
+      </button>
+
+      <button type="button" class="mac-push-btn tray-action-btn" id="trayGatherBtn">
+        <svg class="icon-13" viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="3" y="4.5" width="18" height="15" rx="2" />
+          <path d="M14 9l-4 3 4 3" />
+        </svg>
+        <span>收拢窗口</span>
+      </button>
+    </section>
+
+    <footer class="tray-footer">
+      <button type="button" class="tray-footer-status tabular-nums" id="trayFooterBtn">
+        <span class="status-dot is-green" id="trayFooterDot" aria-hidden="true"></span>
+        <span id="trayFooterText">局域网已连通 · 按 Ctrl 切主屏</span>
+      </button>
+      <button type="button" class="tray-quit-btn" id="trayQuitBtn">退出</button>
+    </footer>
+  </main>
+
+  <div class="mac-popover mac-select-menu" id="traySelectMenu" role="listbox" hidden></div>
+
+  <script src="./tray.js"></script>
+</body>
+</html>

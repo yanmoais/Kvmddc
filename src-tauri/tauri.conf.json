@@ -1,0 +1,91 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Kvmddc",
+  "version": "0.2.0",
+  "identifier": "com.yanmoais.kvmddc",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Kvmddc",
+        "url": "index.html",
+        "width": 1240,
+        "height": 800,
+        "minWidth": 1020,
+        "minHeight": 680,
+        "resizable": true,
+        "visible": false,
+        "center": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": {
+          "x": 18,
+          "y": 21
+        },
+        "acceptFirstMouse": true
+      },
+      {
+        "label": "tray",
+        "title": "Kvmddc 控制中心",
+        "url": "tray.html",
+        "width": 332,
+        "height": 640,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "visible": false,
+        "focus": true
+      },
+      {
+        "label": "picker",
+        "title": "选择目标主机",
+        "url": "picker.html",
+        "width": 256,
+        "height": 172,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "visible": false,
+        "focus": false
+      },
+      {
+        "label": "hud",
+        "title": "Kvmddc 状态指示",
+        "url": "hud.html",
+        "width": 304,
+        "height": 56,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "visible": false,
+        "focus": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.icns",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ]
+  }
+}

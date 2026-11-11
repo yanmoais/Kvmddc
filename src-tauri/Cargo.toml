@@ -1,0 +1,28 @@
+[package]
+name = "kvmddc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "kvmddc_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+chrono.workspace = true
+kvmddc-core = { path = "../crates/kvmddc-core" }
+kvmddc-platform = { path = "../crates/kvmddc-platform" }
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
+tokio.workspace = true
+uuid.workspace = true

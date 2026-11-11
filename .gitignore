@@ -1,0 +1,53 @@
+# OS & Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local workspace rules, internal notes, evidence & verification caches (local-only, never committed)
+.grok/
+AGENTS.md
+CLAUDE.md
+DESIGN.md
+docs/
+evidence/
+outputs/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.mp4
+*.mov
+*.log
+.cache/
+cache/
+tmp/
+temp/
+artifacts/
+test-results/
+playwright-report/
+coverage/
+
+# Rust & Tauri / Frontend build outputs
+target/
+node_modules/
+dist/
+src-tauri/gen/schemas/
+src-tauri/icons/
+
+# Runtime secrets, certificates, local configs & SQLite DBs
+.kvmddc/
+*.pem
+*.key
+*.crt
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+config.json
+config.*.json
+config.local.json
+.env
+.env.*

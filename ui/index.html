@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark" data-topology="dual">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kvmddc</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="studio-backdrop" aria-hidden="true"></div>
+  <canvas id="stageCanvas" aria-label="Kvmddc 虚拟工作室桌面三维舞台"></canvas>
+  <div class="window-drag-bar" data-tauri-drag-region aria-hidden="true"></div>
+
+  <header class="top-chrome" aria-label="顶部贴边操作栏">
+    <div class="top-left-group">
+      <div class="alert-inline-pill" id="alertBanner" role="status" data-tone="red" hidden>
+        <span class="status-dot is-red" id="alertDot" aria-hidden="true"></span>
+        <span class="alert-inline-text" id="alertMessage">切源未响应</span>
+        <button type="button" class="alert-retry-btn" id="alertRetryBtn">重试</button>
+        <button type="button" class="alert-retry-btn" id="alertDismissBtn" aria-label="关闭提示">关闭</button>
+      </div>
+    </div>
+
+    <div class="top-dock-zone" id="topDockZone" data-open="false">
+      <div class="top-edge-sensor" id="topEdgeSensor">
+        <button type="button" class="top-edge-lip" id="topEdgeLip" aria-label="展开顶部操作工具栏">
+          <span class="lip-dot" id="topDockDot" aria-hidden="true"></span>
+          <span class="lip-bar" aria-hidden="true"></span>
+        </button>
+      </div>
+
+      <div class="top-dock-tray" id="topDockTray">
+        <div class="mac-popover top-dock-bar" id="topDockBar" role="toolbar" aria-label="桌面视图与快捷动作">
+          <div class="mac-seg" id="topologyBar" role="tablist" aria-label="桌面设备视图">
+            <button type="button" class="mac-seg-btn is-active" data-topo-mode="auto">自动识别</button>
+            <button type="button" class="mac-seg-btn" data-topo-mode="dual">双机桌面</button>
+            <button type="button" class="mac-seg-btn" data-topo-mode="triple">三机桌面</button>
+          </div>
+
+          <span class="crown-sep" aria-hidden="true"></span>
+
+          <div class="top-action-group" role="group" aria-label="桌面快捷动作">
+            <button type="button" class="top-tool-btn" id="btnPairNow">
+              <svg class="icon-13" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M10 13a5 5 0 0 0 7.1 0l2.8-2.8a5 5 0 0 0-7.1-7.1L11.2 4.7" />
+                <path d="M14 11a5 5 0 0 0-7.1 0l-2.8 2.8a5 5 0 0 0 7.1 7.1l1.6-1.6" />
+              </svg>
+              <span>配对校准</span>
+            </button>
+            <button type="button" class="top-tool-btn" id="btnLeaveDesk">
+              <svg class="icon-13" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 12h11M11 8l4 4-4 4M19 5v14" />
+              </svg>
+              <span>离桌让屏</span>
+            </button>
+            <button type="button" class="top-tool-btn" id="btnGatherWin">
+              <svg class="icon-13" viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="3" y="4.5" width="18" height="15" rx="2" />
+                <path d="M14 9l-4 3 4 3" />
+              </svg>
+              <span>收拢窗口</span>
+            </button>
+            <button type="button" class="top-tool-btn" id="btnSleepTop" aria-pressed="false">
+              <svg class="icon-13" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M20.4 14.2A8.4 8.4 0 0 1 9.8 3.6a8.4 8.4 0 1 0 10.6 10.6Z" />
+              </svg>
+              <span>熄屏待机</span>
+            </button>
+          </div>
+
+          <span class="crown-sep" aria-hidden="true"></span>
+
+          <div class="mac-seg" id="themeSwitch" aria-label="浅色与深色外观">
+            <button type="button" class="mac-seg-btn" data-theme-val="light">浅色</button>
+            <button type="button" class="mac-seg-btn is-active" data-theme-val="dark">深色</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <div class="stage-hit-layer" id="stageHitLayer" aria-hidden="true">
+    <button type="button" class="mesh-hit hit-win" id="hitWinMesh" tabindex="-1" title="点击切至 Windows 台式机"></button>
+    <button type="button" class="mesh-hit hit-studio" id="hitStudioMesh" tabindex="-1" title="点击切至 Mac Studio"></button>
+    <button type="button" class="mesh-hit hit-ext" id="hitExtScreen" tabindex="-1" title="查看主显示器当前连接状态"></button>
+    <button type="button" class="mesh-hit hit-mbp" id="hitMbpScreen" tabindex="-1" title="点击切至 MacBook Pro 或上下拖拽调节双屏对齐"></button>
+  </div>
+
+  <main class="spatial-overlay" aria-label="屏框抽屉交互区">
+    <div class="edge-zone pos-ext-top" id="zoneLensTop" data-open="false">
+      <button type="button" class="edge-lip lip-horiz" aria-label="展开主显示器顶框控制栏">
+        <span class="lip-dot" id="lensTopDot"></span>
+        <span class="lip-bar"></span>
+      </button>
+
+      <div class="mac-popover bezel-crown" id="lensDisplayCrown" role="region" aria-label="外接大屏信号与亮度">
+        <div class="mac-seg crown-host-seg" id="lensHostSeg" data-count="2">
+          <button type="button" class="mac-seg-btn is-active" data-host="macbook">
+            <span class="host-dot is-on" aria-hidden="true"></span>
+            <span>MacBook</span>
+          </button>
+          <button type="button" class="mac-seg-btn" data-host="windows">
+            <span class="host-dot" aria-hidden="true"></span>
+            <span>Windows</span>
+          </button>
+          <button type="button" class="mac-seg-btn" data-host="studio" id="lensStudioSegBtn" hidden>
+            <span class="host-dot" aria-hidden="true"></span>
+            <span>Studio</span>
+          </button>
+        </div>
+
+        <span class="crown-sep" aria-hidden="true"></span>
+
+        <div class="crown-slider-group">
+          <svg class="icon-14 muted-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="4.2" />
+            <path d="M12 2.5v2.4M12 19.1v2.4M4.9 4.9l1.7 1.7M17.4 17.4l1.7 1.7M2.5 12h2.4M19.1 12h2.4M4.9 19.1l1.7-1.7M17.4 6.6l1.7-1.7" />
+          </svg>
+          <div class="chiclet-slider crown-chiclet" id="lensSlider" role="slider" tabindex="0" aria-label="主显示器硬件亮度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="85"></div>
+          <span class="slider-readout tabular-nums" id="lensBrightnessPct">85%</span>
+        </div>
+
+        <span class="crown-sep" aria-hidden="true"></span>
+
+        <div class="crown-slider-group">
+          <button type="button" class="crown-mute-btn" id="lensMuteBtn" aria-pressed="false" aria-label="切换系统与显示器静音" title="切换系统与显示器静音">
+            <svg class="icon-14" id="lensMuteIcon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M11 5L6.5 9H3.5v6h3L11 19V5Z" />
+              <path d="M15.5 8.8a4.8 4.8 0 0 1 0 6.4M18.6 6.2a8.5 8.5 0 0 1 0 11.6" />
+            </svg>
+          </button>
+          <div class="chiclet-slider crown-vol-chiclet" id="lensVolSlider" role="slider" tabindex="0" aria-label="系统与显示器音量" aria-valuemin="0" aria-valuemax="100" aria-valuenow="75"></div>
+          <span class="slider-readout tabular-nums" id="lensVolumePct">75%</span>
+        </div>
+
+        <span class="crown-sep" aria-hidden="true"></span>
+
+        <button type="button" class="mac-popup-btn tabular-nums" id="lensColorBtn" aria-haspopup="listbox" aria-expanded="false" title="点击选择当前主机色温预设">
+          <span id="lensColorLabel">6500K</span>
+          <span class="mac-popup-chevrons" aria-hidden="true">
+            <svg viewBox="0 0 8 12"><path d="M1.5 4.2L4 1.7l2.5 2.5M1.5 7.8L4 10.3l2.5-2.5" /></svg>
+          </span>
+        </button>
+
+        <button type="button" class="mac-push-btn" id="lensSleepBtn" aria-pressed="false">
+          <svg class="icon-13" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M20.4 14.2A8.4 8.4 0 0 1 9.8 3.6a8.4 8.4 0 1 0 10.6 10.6Z" />
+          </svg>
+          <span id="lensSleepLabel">熄屏</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="edge-zone pos-ext-seam" id="zoneLensSeam" data-open="false">
+      <button type="button" class="edge-lip lip-vert" aria-label="展开双屏跨屏设置">
+        <span class="lip-dot" id="lensSeamDot"></span>
+        <span class="lip-bar"></span>
+      </button>
+
+      <div class="mac-popover seam-popover" id="lensSeamHub" role="region" aria-label="双屏跨屏设置">
+        <div class="mac-form-row">
+          <span class="mac-row-label">副屏高度</span>
+          <div class="mac-stepper-field">
+            <span class="mac-stepper-val tabular-nums" id="lensAlignVal">81%</span>
+            <span class="mac-stepper-divider" aria-hidden="true"></span>
+            <div class="mac-stepper-btns">
+              <button type="button" class="mac-step-half" id="alignUpBtn" aria-label="上移副屏对齐">
+                <svg viewBox="0 0 10 6" aria-hidden="true"><path d="M1.5 4.5L5 1.5l3.5 3" /></svg>
+              </button>
+              <button type="button" class="mac-step-half" id="alignDownBtn" aria-label="下移副屏对齐">
+                <svg viewBox="0 0 10 6" aria-hidden="true"><path d="M1.5 1.5L5 4.5l3.5-3" /></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="mac-form-sep" aria-hidden="true"></div>
+
+        <button type="button" class="mac-form-row mac-switch-row" id="lensDeskflowBtn" role="switch" aria-checked="true">
+          <span class="mac-row-label">键鼠跨屏守护</span>
+          <span class="mac-switch" aria-hidden="true"><span class="mac-switch-thumb"></span></span>
+        </button>
+
+        <div class="mac-form-sep" aria-hidden="true"></div>
+
+        <button type="button" class="mac-form-row mac-switch-row" id="lensSlideBtn" role="switch" aria-checked="true">
+          <span class="mac-row-label">右滑进笔记本屏</span>
+          <span class="mac-switch" aria-hidden="true"><span class="mac-switch-thumb"></span></span>
+        </button>
+
+        <div class="mac-form-sep" aria-hidden="true"></div>
+
+        <button type="button" class="mac-form-row mac-switch-row" id="lensPortalBtn" role="switch" aria-checked="false">
+          <span class="mac-row-label">按 Ctrl 切主屏</span>
+          <span class="mac-switch" aria-hidden="true"><span class="mac-switch-thumb"></span></span>
+        </button>
+
+        <div class="mac-form-sep" aria-hidden="true"></div>
+
+        <button type="button" class="mac-form-row mac-switch-row" id="lensModMapBtn" role="switch" aria-checked="true">
+          <span class="mac-row-label">⌘/Ctrl 跨机对齐</span>
+          <span class="mac-switch" aria-hidden="true"><span class="mac-switch-thumb"></span></span>
+        </button>
+      </div>
+    </div>
+
+    <div class="edge-zone pos-mbp-top" id="zoneLensMbp" data-open="false">
+      <button type="button" class="edge-lip lip-horiz lip-compact" aria-label="展开键鼠连接设置">
+        <span class="lip-bar"></span>
+      </button>
+
+      <div class="mac-popover mbp-popover" id="lensMbpCrown" role="region" aria-label="键鼠连接源">
+        <span class="mac-row-label">键鼠直连源</span>
+        <button type="button" class="mac-popup-btn" id="lensKmBtn">
+          <span class="tabular-nums" id="lensKmLabel">Windows 直连</span>
+          <span class="mac-popup-chevrons" aria-hidden="true">
+            <svg viewBox="0 0 8 12"><path d="M1.5 4.2L4 1.7l2.5 2.5M1.5 7.8L4 10.3l2.5-2.5" /></svg>
+          </span>
+        </button>
+      </div>
+    </div>
+  </main>
+
+  <section class="device-mounts-layer" id="deviceMountsLayer" aria-label="桌面设备空间挂载胶囊与悬停详情">
+    <div class="device-mount" id="mountWindows" data-device="windows" data-active="false" data-expanded="false">
+      <span class="mount-tether" aria-hidden="true"><i class="tether-dot"></i></span>
+      <button type="button" class="mount-pill is-host" id="cardWindows" aria-expanded="false">
+        <span class="mount-icon-slot" aria-hidden="true">
+          <svg class="icon-17" viewBox="0 0 24 24">
+            <rect x="5" y="2.5" width="14" height="19" rx="2.2" />
+            <line x1="8.5" y1="6.5" x2="15.5" y2="6.5" />
+            <rect x="8.5" y="9.8" width="7" height="5.2" rx="1" />
+            <circle cx="15" cy="18" r="0.9" />
+          </svg>
+        </span>
+        <span class="mount-content">
+          <span class="mount-top-line">
+            <span class="mount-name">Windows 台式机</span>
+            <span class="mount-status" id="badgeWindows">
+              <span class="badge-dot is-standby" id="dotWindows" aria-hidden="true"></span>
+              <span id="stateWindows">键鼠直连</span>
+            </span>
+          </span>
+          <span class="mount-brief tabular-nums" id="specWindows">HDMI 2.1 · RTX 5060 Ti · 300Hz</span>
+        </span>
+      </button>
+
+      <div class="mount-inspector mac-popover" id="inspectorWindows" role="region" aria-label="Windows 台式机链路参数">
+        <button type="button" class="ins-row ins-port-btn" id="btnCycleWinPort" aria-haspopup="listbox" aria-expanded="false" title="点击选择视频接口或恢复自动识别">
+          <span class="ins-k">视频接口</span>
+          <span class="ins-select-right">
+            <span class="ins-v tabular-nums" id="insWinPort">HDMI 2.1 · 自动识别</span>
+            <span class="mac-popup-chevrons" aria-hidden="true">
+              <svg viewBox="0 0 8 12"><path d="M1.5 4.2L4 1.7l2.5 2.5M1.5 7.8L4 10.3l2.5-2.5" /></svg>
+            </span>
+          </span>
+        </button>
+        <div class="ins-sep" aria-hidden="true"></div>
+        <button type="button" class="ins-row ins-port-btn" id="btnSelectWinMode" aria-haspopup="listbox" aria-expanded="false" title="点击切换 Windows 显示分辨率与刷新率">
+          <span class="ins-k">输出时序</span>
+          <span class="ins-select-right">
+            <span class="ins-v tabular-nums" id="insWinMode">5120×2880 · 75Hz</span>
+            <span class="mac-popup-chevrons" aria-hidden="true">
+              <svg viewBox="0 0 8 12"><path d="M1.5 4.2L4 1.7l2.5 2.5M1.5 7.8L4 10.3l2.5-2.5" /></svg>
+            </span>
+          </span>
+        </button>
+        <div class="ins-sep" aria-hidden="true"></div>
+        <div class="ins-row">
+          <span class="ins-k">独立显卡</span>
+          <span class="ins-v tabular-nums" id="insWinHost">RTX 5060 Ti · 局域网在线</span>
+        </div>
+        <div class="ins-sep" aria-hidden="true"></div>
+        <div class="ins-row">
+          <span class="ins-k">键鼠通道</span>
+          <span class="ins-v tabular-nums" id="insWinKm">USB 接收器直连</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="device-mount is-hidden" id="mountStudio" data-device="studio" data-active="false" data-expanded="false">
+      <span class="mount-tether" aria-hidden="true"><i class="tether-dot"></i></span>
+      <button type="button" class="mount-pill is-host" id="cardStudio" aria-expanded="false">
+        <span class="mount-icon-slot" aria-hidden="true">
+          <svg class="icon-17" viewBox="0 0 24 24">
+            <rect x="3.5" y="7" width="17" height="9.8" rx="2.6" />
+            <line x1="7.5" y1="12.6" x2="7.5" y2="14.2" />
+            <line x1="10" y1="12.6" x2="10" y2="14.2" />
+            <line x1="12.6" y1="13.4" x2="15.8" y2="13.4" />
+          </svg>
+        </span>
+        <span class="mount-content">
+          <span class="mount-top-line">
+            <span class="mount-name">Mac Studio</span>
+            <span class="mount-status" id="badgeStudio">
+              <span class="badge-dot is-standby" id="dotStudio" aria-hidden="true"></span>
+              <span id="stateStudio">待机在线</span>
+            </span>
+          </span>
+          <span class="mount-brief tabular-nums" id="specStudio">DP 1.4 · M5 Max · 5K 120Hz</span>
+        </span>
+      </button>
+
+      <div class="mount-inspector mac-popover" id="inspectorStudio" role="region" aria-label="Mac Studio 链路参数">
+        <button type="button" class="ins-row ins-port-btn" id="btnCycleStuPort" aria-haspopup="listbox" aria-expanded="false" title="点击选择视频接口或恢复自动识别">
+          <span class="ins-k">视频接口</span>
+          <span class="ins-select-right">
+            <span class="ins-v tabular-nums" id="insStuPort">DP 1.4 · 自动识别</span>
+            <span class="mac-popup-chevrons" aria-hidden="true">
+              <svg viewBox="0 0 8 12"><path d="M1.5 4.2L4 1.7l2.5 2.5M1.5 7.8L4 10.3l2.5-2.5" /></svg>
+            </span>
+          </span>
+        </button>
+        <div class="ins-sep" aria-hidden="true"></div>
+        <button type="button" class="ins-row ins-port-btn" id="btnSelectStuMode" aria-haspopup="listbox" aria-expanded="false" title="点击切换 Mac Studio 显示分辨率与 HiDPI">
+          <span class="ins-k">图形输出</span>
+          <span class="ins-select-right">
+            <span class="ins-v tabular-nums" id="insStuMode">5120×2880 · 120Hz</span>
+            <span class="mac-popup-chevrons" aria-hidden="true">
+              <svg viewBox="0 0 8 12"><path d="M1.5 4.2L4 1.7l2.5 2.5M1.5 7.8L4 10.3l2.5-2.5" /></svg>
+            </span>
+          </span>
+        </button>
+        <div class="ins-sep" aria-hidden="true"></div>
+        <div class="ins-row">
+          <span class="ins-k">计算核心</span>
+          <span class="ins-v tabular-nums" id="insStuHost">Apple M5 Max · 槽位 3</span>
+        </div>
+        <div class="ins-sep" aria-hidden="true"></div>
+        <div class="ins-row">
+          <span class="ins-k">跨屏跟随</span>
+          <span class="ins-v tabular-nums" id="insStuKm">切屏自动跟随</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="device-mount" id="mountMonitor" data-device="monitor" data-active="false" data-expanded="false">
+      <span class="mount-tether" aria-hidden="true"><i class="tether-dot"></i></span>
+      <button type="button" class="mount-pill is-monitor" id="cardMonitor" aria-expanded="false">
+        <span class="mount-icon-slot" aria-hidden="true">
+          <svg class="icon-17" viewBox="0 0 24 24">
+            <rect x="2.5" y="3.5" width="19" height="13" rx="2" />
+            <path d="M9 20.5h6M12 16.5v4" />
+          </svg>
+        </span>
+        <span class="mount-content">
+          <span class="mount-top-line">
+            <span class="mount-name" id="nameMonitor">飞利浦 27E2N6900RW</span>
+            <span class="mount-status" id="badgeMonitor">
+              <span class="badge-dot is-online" id="dotMonitor" aria-hidden="true"></span>
+              <span class="tabular-nums" id="stateMonitor">USB-C · 85%</span>
+            </span>
+          </span>
+          <span class="mount-brief tabular-nums" id="specMonitor">27" 5K 主屏 · 5120×2880 75Hz</span>
+        </span>
+      </button>
+
+      <div class="mount-inspector mac-popover" id="inspectorMonitor" role="region" aria-label="飞利浦显示器实时参数">
+        <div class="ins-row">
+          <span class="ins-k">当前信号</span>
+          <span class="ins-v tabular-nums" id="insMonInput">USB-C · MacBook Pro</span>
+        </div>
+        <div class="ins-sep" aria-hidden="true"></div>
+        <button type="button" class="ins-row ins-port-btn" id="btnSelectMonMode" aria-haspopup="listbox" aria-expanded="false" title="点击切换当前画面显示分辨率与 HiDPI">
+          <span class="ins-k">显示模式</span>
+          <span class="ins-select-right">
+            <span class="ins-v tabular-nums" id="insMonMode">2560×1440 · 75Hz · HiDPI</span>
+            <span class="mac-popup-chevrons" aria-hidden="true">
+              <svg viewBox="0 0 8 12"><path d="M1.5 4.2L4 1.7l2.5 2.5M1.5 7.8L4 10.3l2.5-2.5" /></svg>
+            </span>
+          </span>
+        </button>
+        <div class="ins-sep" aria-hidden="true"></div>
+        <div class="ins-row">
+          <span class="ins-k">音画输出</span>
+          <span class="ins-v tabular-nums" id="insMonBri">亮度 85% · 音量 75%</span>
+        </div>
+        <div class="ins-sep" aria-hidden="true"></div>
+        <button type="button" class="ins-row ins-port-btn" id="btnCycleColorPreset" aria-haspopup="listbox" aria-expanded="false" title="点击选择当前主机的记忆色温">
+          <span class="ins-k">色温记忆</span>
+          <span class="ins-select-right">
+            <span class="ins-v tabular-nums" id="insMonColor">6500K 标准</span>
+            <span class="mac-popup-chevrons" aria-hidden="true">
+              <svg viewBox="0 0 8 12"><path d="M1.5 4.2L4 1.7l2.5 2.5M1.5 7.8L4 10.3l2.5-2.5" /></svg>
+            </span>
+          </span>
+        </button>
+      </div>
+    </div>
+
+    <div class="device-mount" id="mountMacbook" data-device="macbook" data-active="true" data-expanded="false">
+      <span class="mount-tether" aria-hidden="true"><i class="tether-dot"></i></span>
+      <button type="button" class="mount-pill is-host" id="cardMacbook" aria-expanded="false">
+        <span class="mount-icon-slot" aria-hidden="true">
+          <svg class="icon-17" viewBox="0 0 24 24">
+            <rect x="3.8" y="4.5" width="16.4" height="11.5" rx="1.8" />
+            <line x1="10.5" y1="4.5" x2="13.5" y2="4.5" />
+            <path d="M2 18.5h20" />
+          </svg>
+        </span>
+        <span class="mount-content">
+          <span class="mount-top-line">
+            <span class="mount-name">MacBook Pro 14</span>
+            <span class="mount-status" id="badgeMacbook">
+              <span class="badge-dot is-active" id="dotMacbook" aria-hidden="true"></span>
+              <span id="stateMacbook">当前画面</span>
+            </span>
+          </span>
+          <span class="mount-brief tabular-nums" id="specMacbook">USB-C 96W · 5K 主屏 + 14" 内屏</span>
+        </span>
+      </button>
+
+      <div class="mount-inspector mac-popover" id="inspectorMacbook" role="region" aria-label="MacBook Pro 14 链路参数">
+        <button type="button" class="ins-row ins-port-btn" id="btnCycleMbpPort" aria-haspopup="listbox" aria-expanded="false" title="点击选择视频接口或恢复自动识别">
+          <span class="ins-k">视频接口</span>
+          <span class="ins-select-right">
+            <span class="ins-v tabular-nums" id="insMbpPort">USB-C · 自动识别</span>
+            <span class="mac-popup-chevrons" aria-hidden="true">
+              <svg viewBox="0 0 8 12"><path d="M1.5 4.2L4 1.7l2.5 2.5M1.5 7.8L4 10.3l2.5-2.5" /></svg>
+            </span>
+          </span>
+        </button>
+        <div class="ins-sep" aria-hidden="true"></div>
+        <button type="button" class="ins-row ins-port-btn" id="btnSelectMbpMode" aria-haspopup="listbox" aria-expanded="false" title="点击切换 MacBook Pro 显示分辨率与 HiDPI">
+          <span class="ins-k">显示模式</span>
+          <span class="ins-select-right">
+            <span class="ins-v tabular-nums" id="insMbpMode">2560×1440 · 75Hz · HiDPI</span>
+            <span class="mac-popup-chevrons" aria-hidden="true">
+              <svg viewBox="0 0 8 12"><path d="M1.5 4.2L4 1.7l2.5 2.5M1.5 7.8L4 10.3l2.5-2.5" /></svg>
+            </span>
+          </span>
+        </button>
+        <div class="ins-sep" aria-hidden="true"></div>
+        <div class="ins-row">
+          <span class="ins-k">内屏色彩</span>
+          <span class="ins-v tabular-nums">Liquid XDR · Sonoma</span>
+        </div>
+        <div class="ins-sep" aria-hidden="true"></div>
+        <div class="ins-row">
+          <span class="ins-k">边缘对齐</span>
+          <span class="ins-v tabular-nums" id="insMbpSync">高度 81% · 右滑进笔记本屏</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="perm-overlay" id="permOverlay" hidden>
+    <div class="mac-popover perm-dialog" role="dialog" aria-modal="true" aria-labelledby="permTitle">
+      <div class="perm-head">
+        <div class="perm-title-wrap">
+          <svg class="icon-17 perm-shield-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 3l7 3v5.5c0 4.6-3 8.6-7 9.5-4-.9-7-4.9-7-9.5V6l7-3Z" />
+            <path d="M9.5 12.2l1.8 1.8 3.6-3.8" />
+          </svg>
+          <span class="perm-title" id="permTitle">开启辅助功能权限</span>
+        </div>
+        <span class="perm-badge">
+          <span class="status-dot is-amber" id="permDot" aria-hidden="true"></span>
+          <span id="permStatusText">待授权</span>
+        </span>
+      </div>
+
+      <p class="perm-desc">
+        跨屏共享一套键鼠需要在系统设置「辅助功能」中打开 Kvmddc。若开关已是蓝色仍提示待授权，请将其先关闭再重新打开一次刷新签名，完成后浮窗会自动收起。
+      </p>
+
+      <div class="mac-form-sep" aria-hidden="true"></div>
+
+      <div class="perm-actions">
+        <button type="button" class="perm-later-btn" id="permLaterBtn">稍后</button>
+        <div class="perm-actions-right">
+          <button type="button" class="mac-push-btn" id="permRestartBtn">已刷新，重新检测</button>
+          <button type="button" class="perm-primary-btn" id="permOpenBtn">打开系统设置</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mac-popover mac-select-menu" id="stageSelectMenu" role="listbox" hidden></div>
+
+  <script src="./bundle.js"></script>
+</body>
+</html>

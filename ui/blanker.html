@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN" class="blanker-root">
+  <head>
+    <meta charset="utf-8" />
+    <title>Kvmddc Standby</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body class="blanker-body">
+    <script>
+      (function () {
+        let armedAt = performance.now();
+        let waking = false;
+
+        window.__armBlanker = function () {
+          armedAt = performance.now();
+          waking = false;
+        };
+
+        function triggerWake() {
+          if (waking) return;
+          if (performance.now() - armedAt < 420) return;
+          waking = true;
+          if (
+            window.__TAURI_INTERNALS__ &&
+            typeof window.__TAURI_INTERNALS__.invoke === "function"
+          ) {
+            window.__TAURI_INTERNALS__.invoke("wake_displays").catch(function () {
+              waking = false;
+            });
+          }
+        }
+
+        window.addEventListener("keydown", function (e) {
+          if (!e.repeat) triggerWake();
+        });
+        window.addEventListener("mousedown", triggerWake);
+        window.addEventListener("contextmenu", function (e) {
+          e.preventDefault();
+          triggerWake();
+        });
+      })();
+    </script>
+  </body>
+</html>

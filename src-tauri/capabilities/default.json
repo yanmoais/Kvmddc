@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability for Kvmddc main, tray popover, edge picker, HUD, and standby blanker windows",
+  "windows": ["main", "tray", "picker", "hud", "blanker-*"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging"
+  ]
+}
