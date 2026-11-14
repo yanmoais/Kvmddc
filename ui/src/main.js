@@ -996,6 +996,21 @@ async function bootstrap() {
     };
   }
 
+  function projectLocalRectPx(obj3d, box) {
+    tmpVecA.set(box.minX, box.minY, box.z || 0).applyMatrix4(obj3d.matrixWorld).project(camera);
+    const x0 = (tmpVecA.x * 0.5 + 0.5) * window.innerWidth;
+    const y0 = (-tmpVecA.y * 0.5 + 0.5) * window.innerHeight;
+    tmpVecA.set(box.maxX, box.maxY, box.z || 0).applyMatrix4(obj3d.matrixWorld).project(camera);
+    const x1 = (tmpVecA.x * 0.5 + 0.5) * window.innerWidth;
+    const y1 = (-tmpVecA.y * 0.5 + 0.5) * window.innerHeight;
+    return {
+      cx: (x0 + x1) * 0.5,
+      cy: (y0 + y1) * 0.5,
+      w: Math.max(48, Math.abs(x1 - x0)),
+      h: Math.max(40, Math.abs(y1 - y0))
+    };
+  }
+
   function updateAllPortCables() {
     scene.updateMatrixWorld(true);
     philipsDisplay.userData.anchorCableSlot.getWorldPosition(tmpVecB);
@@ -1103,29 +1118,40 @@ async function bootstrap() {
     const extSeam = toScreenPx(philipsDisplay.userData.anchorRightSeam);
     const mbpTop = toScreenPx(macbookPro.userData.anchorTopCrown);
 
-    const crownPad = Math.min(420, Math.floor(vw * 0.36));
+    const crownPad = Math.min(180, Math.floor(vw * 0.24));
     rootStyle.setProperty('--ext-top-x', `${Math.round(THREE.MathUtils.clamp(extTop.x, crownPad, vw - crownPad))}px`);
     rootStyle.setProperty('--ext-top-y', `${Math.round(THREE.MathUtils.clamp(extTop.y, 68, vh - 250))}px`);
 
-    rootStyle.setProperty('--seam-x', `${Math.round(THREE.MathUtils.clamp(extSeam.x + 6, 300, vw - 230))}px`);
+    rootStyle.setProperty('--seam-x', `${Math.round(THREE.MathUtils.clamp(extSeam.x + 6, 180, vw - 220))}px`);
     rootStyle.setProperty('--seam-y', `${Math.round(THREE.MathUtils.clamp(extSeam.y, 160, vh - 230))}px`);
 
-    rootStyle.setProperty('--mbp-top-x', `${Math.round(THREE.MathUtils.clamp(mbpTop.x, 340, vw - 140))}px`);
-    rootStyle.setProperty('--mbp-top-y', `${Math.round(THREE.MathUtils.clamp(mbpTop.y - 2, 180, vh - 210))}px`);
+    rootStyle.setProperty('--mbp-top-x', `${Math.round(THREE.MathUtils.clamp(mbpTop.x, 140, vw - 120))}px`);
+    rootStyle.setProperty('--mbp-top-y', `${Math.round(THREE.MathUtils.clamp(mbpTop.y - 2, 160, vh - 210))}px`);
 
-    const extCenter = toScreenPx(philipsDisplay.userData.activeScreen);
-    const mbpCenter = toScreenPx(macbookPro.userData.screenMesh);
-    const winCenter = toScreenPx(windowsPC.userData.hitAnchor);
-    const stuCenter = toScreenPx(macStudio.userData.hitAnchor);
+    const extBox = projectLocalRectPx(philipsDisplay, philipsDisplay.userData.hitBox);
+    const mbpBox = projectLocalRectPx(macbookPro, macbookPro.userData.hitBox);
+    const winBox = projectLocalRectPx(windowsPC, windowsPC.userData.hitBox);
+    const stuBox = projectLocalRectPx(macStudio, macStudio.userData.hitBox);
 
-    rootStyle.setProperty('--ext-hit-x', `${Math.round(extCenter.x)}px`);
-    rootStyle.setProperty('--ext-hit-y', `${Math.round(extCenter.y)}px`);
-    rootStyle.setProperty('--mbp-hit-x', `${Math.round(mbpCenter.x)}px`);
-    rootStyle.setProperty('--mbp-hit-y', `${Math.round(mbpCenter.y)}px`);
-    rootStyle.setProperty('--win-hit-x', `${Math.round(winCenter.x)}px`);
-    rootStyle.setProperty('--win-hit-y', `${Math.round(winCenter.y)}px`);
-    rootStyle.setProperty('--studio-hit-x', `${Math.round(stuCenter.x)}px`);
-    rootStyle.setProperty('--studio-hit-y', `${Math.round(stuCenter.y)}px`);
+    rootStyle.setProperty('--ext-hit-x', `${Math.round(extBox.cx)}px`);
+    rootStyle.setProperty('--ext-hit-y', `${Math.round(extBox.cy)}px`);
+    rootStyle.setProperty('--ext-hit-w', `${Math.round(extBox.w)}px`);
+    rootStyle.setProperty('--ext-hit-h', `${Math.round(extBox.h)}px`);
+
+    rootStyle.setProperty('--mbp-hit-x', `${Math.round(mbpBox.cx)}px`);
+    rootStyle.setProperty('--mbp-hit-y', `${Math.round(mbpBox.cy)}px`);
+    rootStyle.setProperty('--mbp-hit-w', `${Math.round(mbpBox.w)}px`);
+    rootStyle.setProperty('--mbp-hit-h', `${Math.round(mbpBox.h)}px`);
+
+    rootStyle.setProperty('--win-hit-x', `${Math.round(winBox.cx)}px`);
+    rootStyle.setProperty('--win-hit-y', `${Math.round(winBox.cy)}px`);
+    rootStyle.setProperty('--win-hit-w', `${Math.round(winBox.w)}px`);
+    rootStyle.setProperty('--win-hit-h', `${Math.round(winBox.h)}px`);
+
+    rootStyle.setProperty('--studio-hit-x', `${Math.round(stuBox.cx)}px`);
+    rootStyle.setProperty('--studio-hit-y', `${Math.round(stuBox.cy)}px`);
+    rootStyle.setProperty('--studio-hit-w', `${Math.round(stuBox.w)}px`);
+    rootStyle.setProperty('--studio-hit-h', `${Math.round(stuBox.h)}px`);
 
     const rawMounts = {
       windows: toScreenPx(windowsPC.userData.anchorMount),
@@ -2253,13 +2279,17 @@ async function bootstrap() {
       openZone(zone.id);
     });
     zone.addEventListener('pointerleave', () => scheduleCloseZone(zone.id));
-    const lip = zone.querySelector('.edge-lip');
-    if (lip) {
-      lip.addEventListener('click', (e) => {
-        e.stopPropagation();
+    zone.addEventListener('click', (e) => {
+      const popover = zone.querySelector('.mac-popover');
+      if (popover && popover.contains(e.target)) return;
+      e.stopPropagation();
+      if (state.openZoneId === zone.id) {
+        state.openZoneId = null;
+        syncUI();
+      } else {
         openZone(zone.id);
-      });
-    }
+      }
+    });
   });
 
   let inspectTimer = null;
@@ -2894,6 +2924,10 @@ async function bootstrap() {
   });
 
   canvas.addEventListener('pointerdown', (e) => {
+    if (state.openZoneId) {
+      state.openZoneId = null;
+      syncUI();
+    }
     isDraggingStage = true;
     lastDragX = e.clientX;
     lastDragY = e.clientY;

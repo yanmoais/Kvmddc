@@ -589,6 +589,13 @@ export function buildPhilips27E2N6900RW({ texFrame, meta, texMac, texWin, texStu
 
   root.userData = {
     activeScreen,
+    hitBox: {
+      minX: sx - sw * 0.5,
+      maxX: sx + sw * 0.5,
+      minY: sy - sh * 0.5,
+      maxY: sy + sh * 0.5,
+      z: 0
+    },
     panelUniforms,
     powerLedMat,
     plateUniforms: frameMat.uniforms,
@@ -643,6 +650,13 @@ export function buildWindowsWorkstationPC({ texIdle, texActive, meta }) {
     plateUniforms: plateMat.uniforms,
     targetActiveMix: 0.0,
     hitAnchor,
+    hitBox: {
+      minX: -W * 0.44,
+      maxX: W * 0.44,
+      minY: 0.04 * H - 3.1,
+      maxY: 0.96 * H - 3.1,
+      z: 0
+    },
     anchorCablePort,
     anchorMount,
     setActivityState
@@ -696,6 +710,13 @@ export function buildMacStudioM5({ texStudio, meta }) {
     ledMat,
     plateUniforms: plateMat.uniforms,
     hitAnchor,
+    hitBox: {
+      minX: -W * 0.48,
+      maxX: W * 0.48,
+      minY: 0.04 * H - 0.04,
+      maxY: 0.96 * H - 0.04,
+      z: 0
+    },
     anchorCablePort,
     anchorMount
   };
@@ -742,6 +763,13 @@ export function buildMacBookPro14({ texMbp, meta }) {
 
   root.userData = {
     screenMesh,
+    hitBox: {
+      minX: -0.46 * W,
+      maxX: 0.44 * W,
+      minY: 0.07 * H - 0.12,
+      maxY: 0.97 * H - 0.12,
+      z: 0
+    },
     plateUniforms: plateMat.uniforms,
     anchorTopCrown,
     anchorCablePort,

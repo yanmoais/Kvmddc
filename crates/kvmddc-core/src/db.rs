@@ -669,6 +669,18 @@ impl StateDb {
         }
     }
 
+    pub fn has_pending_request(&self, controller: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM switch_requests WHERE controller = ?1 AND status = 'pending' LIMIT 1",
+                params![controller],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(id.is_some())
+    }
+
     pub fn list_recent_requests(&self, limit: usize) -> Result<Vec<SwitchRequestRow>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(

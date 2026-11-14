@@ -84,9 +84,44 @@ pub fn next_color_preset(current: u8) -> u8 {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedClusterSettings {
+    pub rev: u64,
+    pub input_provider_host_id: Option<String>,
+    pub primary_ddc_controller_id: Option<String>,
+    pub deskflow_enabled: Option<bool>,
+    pub ctrl_edge_switch_enabled: Option<bool>,
+    pub allow_plain_slide_to_internal: Option<bool>,
+    pub unify_cross_os_modifiers: Option<bool>,
+    pub auto_switch_input_provider_on_hotplug: Option<bool>,
+    pub internal_height_percent: Option<u8>,
+}
+
+impl SharedClusterSettings {
+    pub fn has_any_field(&self) -> bool {
+        self.input_provider_host_id.is_some()
+            || self.primary_ddc_controller_id.is_some()
+            || self.deskflow_enabled.is_some()
+            || self.ctrl_edge_switch_enabled.is_some()
+            || self.allow_plain_slide_to_internal.is_some()
+            || self.unify_cross_os_modifiers.is_some()
+            || self.auto_switch_input_provider_on_hotplug.is_some()
+            || self.internal_height_percent.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedSyncOutcome {
+    pub changed: bool,
+    pub deskflow_reload_needed: bool,
+    pub push_back_to_source: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub version: u32,
+    #[serde(default)]
+    pub shared_settings_rev: u64,
     pub local_host_id: String,
     /// Host ID acting as Deskflow keyboard/mouse provider (Server)
     pub input_provider_host_id: String,
@@ -99,7 +134,7 @@ pub struct AppConfig {
     pub settle_ms: u64,
     /// Ctrl + screen edge dwell milliseconds before switching / showing picker (default 180ms)
     pub ctrl_edge_dwell_ms: u64,
-    /// Deskflow server switchDelay in ms for non-Ctrl internal-screen sliding
+    /// Deskflow server switchDelay in ms for non-Ctrl internal-screen sliding (default 120ms)
     pub deskflow_switch_delay_ms: u32,
     /// Master switch for Deskflow cross-host keyboard/mouse sharing daemon
     #[serde(default = "default_true")]
@@ -112,6 +147,9 @@ pub struct AppConfig {
     /// Automatically align Command/Option/Control <-> Ctrl/Alt/Win when crossing macOS <-> Windows
     #[serde(default = "default_true")]
     pub unify_cross_os_modifiers: bool,
+    /// Automatically switch Deskflow input provider when external USB/Bluetooth mouse or keyboard is hotplugged
+    #[serde(default = "default_true")]
+    pub auto_switch_input_provider_on_hotplug: bool,
     pub preferred_brightness: u8,
     #[serde(default = "default_volume")]
     pub preferred_volume: u8,
@@ -127,6 +165,7 @@ impl AppConfig {
     pub fn default_home_setup(local_host_id: &str, shared_token: String) -> Self {
         Self {
             version: 1,
+            shared_settings_rev: 0,
             local_host_id: local_host_id.to_string(),
             input_provider_host_id: "win-desktop".to_string(),
             primary_ddc_controller_id: "macbook".to_string(),
@@ -135,11 +174,12 @@ impl AppConfig {
             shared_token,
             settle_ms: 5000,
             ctrl_edge_dwell_ms: 180,
-            deskflow_switch_delay_ms: 250,
+            deskflow_switch_delay_ms: 120,
             deskflow_enabled: true,
             ctrl_edge_switch_enabled: true,
             allow_plain_slide_to_internal: true,
             unify_cross_os_modifiers: true,
+            auto_switch_input_provider_on_hotplug: true,
             preferred_brightness: 85,
             preferred_volume: 75,
             audio_muted: false,
@@ -426,6 +466,219 @@ impl AppConfig {
             _ => false,
         }
     }
+
+    pub fn internal_height_percent(&self) -> u8 {
+        self.hosts
+            .iter()
+            .find(|h| h.display_profile.has_internal_screen)
+            .map(|h| h.display_profile.internal_height_percent.clamp(60, 100))
+            .unwrap_or(81)
+    }
+
+    pub fn set_internal_height_percent(&mut self, percent: u8) -> bool {
+        let clamped = percent.clamp(60, 100);
+        let mut changed = false;
+        for h in &mut self.hosts {
+            if h.display_profile.has_internal_screen
+                && h.display_profile.internal_height_percent != clamped
+            {
+                h.display_profile.internal_height_percent = clamped;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub fn bump_shared_settings_rev(&mut self) {
+        let now_ms = chrono::Utc::now().timestamp_millis().max(1) as u64;
+        self.shared_settings_rev = now_ms.max(self.shared_settings_rev.saturating_add(1));
+    }
+
+    pub fn shared_settings_snapshot(&self) -> SharedClusterSettings {
+        SharedClusterSettings {
+            rev: self.shared_settings_rev,
+            input_provider_host_id: Some(self.input_provider_host_id.clone()),
+            primary_ddc_controller_id: Some(self.primary_ddc_controller_id.clone()),
+            deskflow_enabled: Some(self.deskflow_enabled),
+            ctrl_edge_switch_enabled: Some(self.ctrl_edge_switch_enabled),
+            allow_plain_slide_to_internal: Some(self.allow_plain_slide_to_internal),
+            unify_cross_os_modifiers: Some(self.unify_cross_os_modifiers),
+            auto_switch_input_provider_on_hotplug: Some(self.auto_switch_input_provider_on_hotplug),
+            internal_height_percent: Some(self.internal_height_percent()),
+        }
+    }
+
+    fn differs_from_shared(&self, incoming: &SharedClusterSettings) -> bool {
+        if let Some(ref p) = incoming.input_provider_host_id {
+            if &self.input_provider_host_id != p && self.hosts.iter().any(|h| &h.id == p) {
+                return true;
+            }
+        }
+        if let Some(ref c) = incoming.primary_ddc_controller_id {
+            if &self.primary_ddc_controller_id != c && self.hosts.iter().any(|h| &h.id == c) {
+                return true;
+            }
+        }
+        if incoming
+            .deskflow_enabled
+            .is_some_and(|v| v != self.deskflow_enabled)
+        {
+            return true;
+        }
+        if incoming
+            .ctrl_edge_switch_enabled
+            .is_some_and(|v| v != self.ctrl_edge_switch_enabled)
+        {
+            return true;
+        }
+        if incoming
+            .allow_plain_slide_to_internal
+            .is_some_and(|v| v != self.allow_plain_slide_to_internal)
+        {
+            return true;
+        }
+        if incoming
+            .unify_cross_os_modifiers
+            .is_some_and(|v| v != self.unify_cross_os_modifiers)
+        {
+            return true;
+        }
+        if incoming
+            .auto_switch_input_provider_on_hotplug
+            .is_some_and(|v| v != self.auto_switch_input_provider_on_hotplug)
+        {
+            return true;
+        }
+        if incoming
+            .internal_height_percent
+            .is_some_and(|v| v.clamp(60, 100) != self.internal_height_percent())
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Reconciles cluster-wide shared settings using revision ordering (`rev`) plus a loop-free
+    /// deterministic `host_id` tie-breaker so split-brain hosts converge cleanly without stale overwrites.
+    pub fn reconcile_shared_settings(
+        &mut self,
+        incoming: &SharedClusterSettings,
+        source_host_id: &str,
+    ) -> SharedSyncOutcome {
+        if !incoming.has_any_field() {
+            return SharedSyncOutcome {
+                changed: false,
+                deskflow_reload_needed: false,
+                push_back_to_source: false,
+            };
+        }
+
+        if incoming.rev < self.shared_settings_rev {
+            return SharedSyncOutcome {
+                changed: false,
+                deskflow_reload_needed: false,
+                push_back_to_source: true,
+            };
+        }
+
+        if incoming.rev == self.shared_settings_rev {
+            if !self.differs_from_shared(incoming) {
+                return SharedSyncOutcome {
+                    changed: false,
+                    deskflow_reload_needed: false,
+                    push_back_to_source: false,
+                };
+            }
+            if source_host_id >= self.local_host_id.as_str() {
+                // Deterministic tie-breaker won by `self`: promote to a strictly newer revision and push back.
+                self.bump_shared_settings_rev();
+                return SharedSyncOutcome {
+                    changed: true,
+                    deskflow_reload_needed: false,
+                    push_back_to_source: true,
+                };
+            }
+        }
+
+        let mut changed = false;
+        let mut reload = false;
+
+        if let Some(ref p) = incoming.input_provider_host_id {
+            if let Some(h) = self.hosts.iter_mut().find(|h| &h.id == p) {
+                if !h.enabled {
+                    h.enabled = true;
+                    changed = true;
+                    reload = true;
+                }
+                if &self.input_provider_host_id != p {
+                    self.input_provider_host_id = p.clone();
+                    changed = true;
+                    reload = true;
+                }
+            }
+        }
+        if let Some(ref c) = incoming.primary_ddc_controller_id {
+            if let Some(h) = self.hosts.iter_mut().find(|h| &h.id == c) {
+                if !h.enabled {
+                    h.enabled = true;
+                    changed = true;
+                }
+                if &self.primary_ddc_controller_id != c {
+                    self.primary_ddc_controller_id = c.clone();
+                    changed = true;
+                }
+            }
+        }
+        if let Some(v) = incoming.deskflow_enabled {
+            if self.deskflow_enabled != v {
+                self.deskflow_enabled = v;
+                changed = true;
+                reload = true;
+            }
+        }
+        if let Some(v) = incoming.ctrl_edge_switch_enabled {
+            if self.ctrl_edge_switch_enabled != v {
+                self.ctrl_edge_switch_enabled = v;
+                changed = true;
+            }
+        }
+        if let Some(v) = incoming.allow_plain_slide_to_internal {
+            if self.allow_plain_slide_to_internal != v {
+                self.allow_plain_slide_to_internal = v;
+                changed = true;
+                reload = true;
+            }
+        }
+        if let Some(v) = incoming.unify_cross_os_modifiers {
+            if self.unify_cross_os_modifiers != v {
+                self.unify_cross_os_modifiers = v;
+                changed = true;
+                reload = true;
+            }
+        }
+        if let Some(v) = incoming.auto_switch_input_provider_on_hotplug {
+            if self.auto_switch_input_provider_on_hotplug != v {
+                self.auto_switch_input_provider_on_hotplug = v;
+                changed = true;
+            }
+        }
+        if let Some(pct) = incoming.internal_height_percent {
+            if self.set_internal_height_percent(pct) {
+                changed = true;
+                reload = true;
+            }
+        }
+        if self.shared_settings_rev != incoming.rev {
+            self.shared_settings_rev = incoming.rev;
+            changed = true;
+        }
+
+        SharedSyncOutcome {
+            changed,
+            deskflow_reload_needed: reload,
+            push_back_to_source: false,
+        }
+    }
 }
 
 /// Enforces J1 hard rule: strictly pure LAN IPv4 (or 127.0.0.1 for local tests), rejecting Tailscale 100.64.0.0/10.
@@ -508,5 +761,58 @@ mod tests {
         assert_eq!(cfg.hosts[2].monitor_input, 17); // Mac Studio owns HDMI (17)
         assert_eq!(cfg.hosts[1].monitor_input, 15); // Windows vacated to DP (15), zero collision!
         assert_eq!(cfg.hosts[0].monitor_input, 21); // MacBook stays USB-C (21)
+    }
+
+    #[test]
+    fn reconcile_shared_settings_prefers_newer_rev_and_breaks_zero_rev_split_brain() {
+        let mut mac = AppConfig::default_home_setup("macbook", "tok".to_string());
+        mac.input_provider_host_id = "macbook".to_string();
+        mac.ctrl_edge_switch_enabled = false;
+        mac.allow_plain_slide_to_internal = false;
+
+        let mut win = AppConfig::default_home_setup("win-desktop", "tok".to_string());
+        win.input_provider_host_id = "win-desktop".to_string();
+        win.ctrl_edge_switch_enabled = true;
+        win.allow_plain_slide_to_internal = true;
+
+        // 1. Equal rev==0 tie-break: macbook < win-desktop, so macbook bumps & asks win-desktop to update.
+        let win_snap = win.shared_settings_snapshot();
+        let mac_outcome = mac.reconcile_shared_settings(&win_snap, "win-desktop");
+        assert!(mac_outcome.changed);
+        assert!(mac_outcome.push_back_to_source);
+        assert_eq!(mac.input_provider_host_id, "macbook");
+        assert!(!mac.ctrl_edge_switch_enabled);
+        assert!(mac.shared_settings_rev > 0);
+
+        // 2. Windows receives higher rev from macbook and converges completely.
+        let mac_snap = mac.shared_settings_snapshot();
+        let win_outcome = win.reconcile_shared_settings(&mac_snap, "macbook");
+        assert!(win_outcome.changed);
+        assert!(win_outcome.deskflow_reload_needed);
+        assert!(!win_outcome.push_back_to_source);
+        assert_eq!(win.input_provider_host_id, "macbook");
+        assert!(!win.ctrl_edge_switch_enabled);
+        assert!(!win.allow_plain_slide_to_internal);
+        assert_eq!(win.shared_settings_rev, mac.shared_settings_rev);
+
+        // 3. Stale lower rev cannot overwrite macbook; tells sender to refresh instead.
+        let mut stale_win = win.shared_settings_snapshot();
+        stale_win.rev = 1;
+        stale_win.ctrl_edge_switch_enabled = Some(true);
+        let stale_outcome = mac.reconcile_shared_settings(&stale_win, "win-desktop");
+        assert!(!stale_outcome.changed);
+        assert!(stale_outcome.push_back_to_source);
+        assert!(!mac.ctrl_edge_switch_enabled);
+
+        // 4. Higher rev from Windows (e.g. user clicked toggle on Windows) syncs controller & height too.
+        win.bump_shared_settings_rev();
+        win.primary_ddc_controller_id = "mac-studio".to_string();
+        win.set_internal_height_percent(78);
+        let win_newer = win.shared_settings_snapshot();
+        let mac_up = mac.reconcile_shared_settings(&win_newer, "win-desktop");
+        assert!(mac_up.changed);
+        assert!(mac_up.deskflow_reload_needed);
+        assert_eq!(mac.primary_ddc_controller_id, "mac-studio");
+        assert_eq!(mac.internal_height_percent(), 78);
     }
 }

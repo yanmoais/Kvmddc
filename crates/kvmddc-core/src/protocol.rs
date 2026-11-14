@@ -1,4 +1,4 @@
-use crate::config::{validate_pure_lan_ip, HostPlatform};
+use crate::config::{validate_pure_lan_ip, AppConfig, HostPlatform, SharedClusterSettings};
 use crate::db::{SwitchRequestRow, SwitchSource};
 use anyhow::{bail, ensure, Context, Result};
 use axum::{
@@ -68,6 +68,40 @@ pub struct PeerStatusResponse {
     pub display_modes: Vec<DisplayModeDto>,
     #[serde(default)]
     pub clamshell_closed: bool,
+    #[serde(default)]
+    pub shared_settings_rev: u64,
+    #[serde(default)]
+    pub input_provider_host_id: Option<String>,
+    #[serde(default)]
+    pub primary_ddc_controller_id: Option<String>,
+    #[serde(default)]
+    pub deskflow_enabled: Option<bool>,
+    #[serde(default)]
+    pub ctrl_edge_switch_enabled: Option<bool>,
+    #[serde(default)]
+    pub allow_plain_slide_to_internal: Option<bool>,
+    #[serde(default)]
+    pub unify_cross_os_modifiers: Option<bool>,
+    #[serde(default)]
+    pub auto_switch_input_provider_on_hotplug: Option<bool>,
+    #[serde(default)]
+    pub internal_height_percent: Option<u8>,
+}
+
+impl PeerStatusResponse {
+    pub fn to_shared_settings(&self) -> SharedClusterSettings {
+        SharedClusterSettings {
+            rev: self.shared_settings_rev,
+            input_provider_host_id: self.input_provider_host_id.clone(),
+            primary_ddc_controller_id: self.primary_ddc_controller_id.clone(),
+            deskflow_enabled: self.deskflow_enabled,
+            ctrl_edge_switch_enabled: self.ctrl_edge_switch_enabled,
+            allow_plain_slide_to_internal: self.allow_plain_slide_to_internal,
+            unify_cross_os_modifiers: self.unify_cross_os_modifiers,
+            auto_switch_input_provider_on_hotplug: self.auto_switch_input_provider_on_hotplug,
+            internal_height_percent: self.internal_height_percent,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,7 +160,11 @@ pub struct PairPeerRequest {
     pub tls_fingerprint: String,
     pub mac_address: Option<String>,
     #[serde(default)]
+    pub shared_settings_rev: Option<u64>,
+    #[serde(default)]
     pub input_provider_host_id: Option<String>,
+    #[serde(default)]
+    pub primary_ddc_controller_id: Option<String>,
     #[serde(default)]
     pub deskflow_enabled: Option<bool>,
     #[serde(default)]
@@ -135,6 +173,66 @@ pub struct PairPeerRequest {
     pub allow_plain_slide_to_internal: Option<bool>,
     #[serde(default)]
     pub unify_cross_os_modifiers: Option<bool>,
+    #[serde(default)]
+    pub auto_switch_input_provider_on_hotplug: Option<bool>,
+    #[serde(default)]
+    pub internal_height_percent: Option<u8>,
+}
+
+impl PairPeerRequest {
+    pub fn announce_only(
+        host_id: String,
+        lan_ip: String,
+        tls_fingerprint: String,
+    ) -> Self {
+        Self {
+            host_id,
+            lan_ip,
+            tls_fingerprint,
+            mac_address: None,
+            shared_settings_rev: None,
+            input_provider_host_id: None,
+            primary_ddc_controller_id: None,
+            deskflow_enabled: None,
+            ctrl_edge_switch_enabled: None,
+            allow_plain_slide_to_internal: None,
+            unify_cross_os_modifiers: None,
+            auto_switch_input_provider_on_hotplug: None,
+            internal_height_percent: None,
+        }
+    }
+
+    pub fn from_config(cfg: &AppConfig, lan_ip: String, tls_fingerprint: String) -> Self {
+        Self {
+            host_id: cfg.local_host_id.clone(),
+            lan_ip,
+            tls_fingerprint,
+            mac_address: None,
+            shared_settings_rev: Some(cfg.shared_settings_rev),
+            input_provider_host_id: Some(cfg.input_provider_host_id.clone()),
+            primary_ddc_controller_id: Some(cfg.primary_ddc_controller_id.clone()),
+            deskflow_enabled: Some(cfg.deskflow_enabled),
+            ctrl_edge_switch_enabled: Some(cfg.ctrl_edge_switch_enabled),
+            allow_plain_slide_to_internal: Some(cfg.allow_plain_slide_to_internal),
+            unify_cross_os_modifiers: Some(cfg.unify_cross_os_modifiers),
+            auto_switch_input_provider_on_hotplug: Some(cfg.auto_switch_input_provider_on_hotplug),
+            internal_height_percent: Some(cfg.internal_height_percent()),
+        }
+    }
+
+    pub fn to_shared_settings(&self) -> SharedClusterSettings {
+        SharedClusterSettings {
+            rev: self.shared_settings_rev.unwrap_or(0),
+            input_provider_host_id: self.input_provider_host_id.clone(),
+            primary_ddc_controller_id: self.primary_ddc_controller_id.clone(),
+            deskflow_enabled: self.deskflow_enabled,
+            ctrl_edge_switch_enabled: self.ctrl_edge_switch_enabled,
+            allow_plain_slide_to_internal: self.allow_plain_slide_to_internal,
+            unify_cross_os_modifiers: self.unify_cross_os_modifiers,
+            auto_switch_input_provider_on_hotplug: self.auto_switch_input_provider_on_hotplug,
+            internal_height_percent: self.internal_height_percent,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -719,6 +817,15 @@ mod tests {
                     current_color_preset: Some(5),
                     display_modes: Vec::new(),
                     clamshell_closed: false,
+                    shared_settings_rev: 0,
+                    input_provider_host_id: Some("win-desktop".to_string()),
+                    primary_ddc_controller_id: Some("macbook".to_string()),
+                    deskflow_enabled: Some(true),
+                    ctrl_edge_switch_enabled: Some(false),
+                    allow_plain_slide_to_internal: Some(false),
+                    unify_cross_os_modifiers: Some(true),
+                    auto_switch_input_provider_on_hotplug: Some(true),
+                    internal_height_percent: Some(100),
                 })
             })
         }
@@ -889,11 +996,15 @@ mod tests {
                     lan_ip: "192.168.1.10".to_string(),
                     tls_fingerprint: "v2:sha256:1234".to_string(),
                     mac_address: None,
+                    shared_settings_rev: Some(42),
                     input_provider_host_id: Some("macbook".to_string()),
+                    primary_ddc_controller_id: Some("macbook".to_string()),
                     deskflow_enabled: Some(true),
                     ctrl_edge_switch_enabled: Some(true),
                     allow_plain_slide_to_internal: Some(false),
                     unify_cross_os_modifiers: Some(true),
+                    auto_switch_input_provider_on_hotplug: Some(true),
+                    internal_height_percent: Some(100),
                 },
             )
             .await

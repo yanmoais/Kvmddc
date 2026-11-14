@@ -11,17 +11,18 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(target_os = "macos")]
-use tauri::{menu::Submenu, RunEvent};
+use tauri::menu::Submenu;
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    DragDropEvent, LogicalPosition, Manager, PhysicalPosition, PhysicalSize, Position, Rect, Size,
-    State, Theme, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    DragDropEvent, LogicalPosition, Manager, PhysicalPosition, PhysicalSize, Position, Rect,
+    RunEvent, Size, State, Theme, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
 
 static LAST_TRAY_BLUR_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_TRAY_CLICK_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_PICKER_SHOW_MS: AtomicU64 = AtomicU64::new(0);
 static HUD_HIDE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn now_epoch_ms() -> u64 {
@@ -325,9 +326,19 @@ fn close_tray_popover(app: tauri::AppHandle) {
     }
 }
 
+fn cleanup_platform_resources() {
+    kvmddc_platform::ensure_display_sleep_prevented(false);
+    kvmddc_platform::kill_orphan_deskflow_processes();
+}
+
+fn perform_clean_exit(app: &tauri::AppHandle) {
+    cleanup_platform_resources();
+    app.exit(0);
+}
+
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
-    app.exit(0);
+    perform_clean_exit(&app);
 }
 
 #[tauri::command]
@@ -358,7 +369,7 @@ async fn confirm_edge_pick(
 
 #[tauri::command]
 async fn cancel_edge_pick(rt: State<'_, ManagedRuntime>) -> Result<(), String> {
-    rt.0.hide_edge_picker().await;
+    rt.0.cancel_edge_picker().await;
     Ok(())
 }
 
@@ -799,18 +810,33 @@ pub fn run_entry() -> anyhow::Result<()> {
             let handle_for_hud = app.handle().clone();
             let rt_for_cb = Arc::clone(&app_rt);
             tauri::async_runtime::spawn(async move {
+                let rt_for_picker_bounds = Arc::clone(&rt_for_cb);
                 rt_for_cb
                     .set_picker_callback(Arc::new(move |sig| {
                         if let Some(pw) = handle_for_picker.get_webview_window("picker") {
                             match sig {
                                 EdgePickerSignal::Show { x, y } => {
+                                    let (cx, cy, ww, wh) =
+                                        clamp_picker_position_for_window(&pw, x, y);
+                                    LAST_PICKER_SHOW_MS
+                                        .store(now_epoch_ms(), Ordering::Relaxed);
+                                    let rt_b = Arc::clone(&rt_for_picker_bounds);
+                                    tauri::async_runtime::spawn(async move {
+                                        rt_b.set_picker_bounds((cx, cy, cx + ww, cy + wh)).await;
+                                    });
+                                    #[cfg(target_os = "macos")]
+                                    let _ = pw.set_position(Position::Logical(
+                                        LogicalPosition::new(f64::from(cx), f64::from(cy)),
+                                    ));
+                                    #[cfg(not(target_os = "macos"))]
                                     let _ = pw.set_position(Position::Physical(
-                                        PhysicalPosition::new(x, y),
+                                        PhysicalPosition::new(cx, cy),
                                     ));
                                     let _ = pw.eval(
                                         "window.__reloadPickerCandidates && window.__reloadPickerCandidates()",
                                     );
                                     let _ = pw.show();
+                                    let _ = pw.set_focus();
                                 }
                                 EdgePickerSignal::Hide => {
                                     let _ = pw.hide();
@@ -870,7 +896,7 @@ pub fn run_entry() -> anyhow::Result<()> {
                             });
                         }
                         "quit" => {
-                            app_handle.exit(0);
+                            perform_clean_exit(app_handle);
                         }
                         _ => {}
                     }
@@ -961,6 +987,30 @@ pub fn run_entry() -> anyhow::Result<()> {
                 }
                 _ => {}
             },
+            "picker" => match event {
+                WindowEvent::Focused(false) => {
+                    let since_show = now_epoch_ms()
+                        .saturating_sub(LAST_PICKER_SHOW_MS.load(Ordering::Relaxed));
+                    if since_show > 180 {
+                        let app_h = window.app_handle().clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Some(rt) = app_h.try_state::<ManagedRuntime>() {
+                                rt.0.cancel_edge_picker().await;
+                            }
+                        });
+                    }
+                }
+                WindowEvent::CloseRequested { api, .. } => {
+                    api.prevent_close();
+                    let app_h = window.app_handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(rt) = app_h.try_state::<ManagedRuntime>() {
+                            rt.0.cancel_edge_picker().await;
+                        }
+                    });
+                }
+                _ => {}
+            },
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![
@@ -1002,18 +1052,155 @@ pub fn run_entry() -> anyhow::Result<()> {
         .build(tauri::generate_context!())
         .map_err(|e| anyhow::anyhow!("Tauri 初始化失败: {e}"))?;
 
-    app.run(|app_handle, event| {
+    app.run(|app_handle, event| match event {
+        RunEvent::Exit => {
+            cleanup_platform_resources();
+        }
         #[cfg(target_os = "macos")]
-        if let RunEvent::Reopen { .. } = event {
+        RunEvent::Reopen { .. } => {
             let since_tray =
                 now_epoch_ms().saturating_sub(LAST_TRAY_CLICK_MS.load(Ordering::Relaxed));
             if since_tray > 400 {
                 show_main_window(app_handle);
             }
         }
-        #[cfg(not(target_os = "macos"))]
-        let _ = (app_handle, event);
+        _ => {
+            let _ = app_handle;
+        }
     });
 
     Ok(())
+}
+
+fn clamp_picker_origin(
+    x: i32,
+    y: i32,
+    win_w: i32,
+    win_h: i32,
+    mon_left: i32,
+    mon_top: i32,
+    mon_w: i32,
+    mon_h: i32,
+    margin_x: i32,
+    margin_y: i32,
+) -> (i32, i32) {
+    let min_x = mon_left + margin_x;
+    let max_x = (mon_left + mon_w - win_w - margin_x).max(min_x);
+    let min_y = mon_top + margin_y;
+    let max_y = (mon_top + mon_h - win_h - margin_y).max(min_y);
+    (x.clamp(min_x, max_x), y.clamp(min_y, max_y))
+}
+
+fn clamp_picker_position_for_window(
+    pw: &tauri::WebviewWindow,
+    x: i32,
+    y: i32,
+) -> (i32, i32, i32, i32) {
+    const LOGICAL_PICKER_W: f64 = 256.0;
+    const LOGICAL_PICKER_H: f64 = 172.0;
+    const LOGICAL_MARGIN_Y: f64 = 12.0;
+
+    let default_w = LOGICAL_PICKER_W as i32;
+    let default_h = LOGICAL_PICKER_H as i32;
+
+    let Ok(monitors) = pw.available_monitors() else {
+        return (x, y, default_w, default_h);
+    };
+    if monitors.is_empty() {
+        return (x, y, default_w, default_h);
+    };
+
+    let outer = pw.outer_size().ok();
+    let mut best_rect: Option<(i32, i32, i32, i32, i32, i32, i32, i64)> = None;
+    for m in monitors {
+        let scale = m.scale_factor().max(1.0);
+        #[cfg(target_os = "macos")]
+        let (ml, mt, mw, mh, ww, wh, margin_y) = {
+            let ml = (f64::from(m.position().x) / scale).round() as i32;
+            let mt = (f64::from(m.position().y) / scale).round() as i32;
+            let mw = (f64::from(m.size().width) / scale).round() as i32;
+            let mh = (f64::from(m.size().height) / scale).round() as i32;
+            let ow = outer
+                .as_ref()
+                .map(|s| (f64::from(s.width) / scale).round() as i32)
+                .unwrap_or(0);
+            let oh = outer
+                .as_ref()
+                .map(|s| (f64::from(s.height) / scale).round() as i32)
+                .unwrap_or(0);
+            (
+                ml,
+                mt,
+                mw,
+                mh,
+                (LOGICAL_PICKER_W as i32).max(ow),
+                (LOGICAL_PICKER_H as i32).max(oh),
+                LOGICAL_MARGIN_Y as i32,
+            )
+        };
+        #[cfg(not(target_os = "macos"))]
+        let (ml, mt, mw, mh, ww, wh, margin_y) = {
+            let ml = m.position().x;
+            let mt = m.position().y;
+            let mw = m.size().width as i32;
+            let mh = m.size().height as i32;
+            let ow = outer.as_ref().map(|s| s.width as i32).unwrap_or(0);
+            let oh = outer.as_ref().map(|s| s.height as i32).unwrap_or(0);
+            (
+                ml,
+                mt,
+                mw,
+                mh,
+                ((LOGICAL_PICKER_W * scale).round() as i32).max(ow),
+                ((LOGICAL_PICKER_H * scale).round() as i32).max(oh),
+                (LOGICAL_MARGIN_Y * scale).round() as i32,
+            )
+        };
+
+        let dx = if x < ml {
+            ml - x
+        } else if x >= ml + mw {
+            x - (ml + mw - 1)
+        } else {
+            0
+        };
+        let dy = if y < mt {
+            mt - y
+        } else if y >= mt + mh {
+            y - (mt + mh - 1)
+        } else {
+            0
+        };
+        let dist2 = i64::from(dx) * i64::from(dx) + i64::from(dy) * i64::from(dy);
+        if best_rect
+            .as_ref()
+            .is_none_or(|b| dist2 < b.7)
+        {
+            best_rect = Some((ml, mt, mw, mh, ww, wh, margin_y, dist2));
+        }
+    }
+
+    let Some((ml, mt, mw, mh, ww, wh, margin_y, _)) = best_rect else {
+        return (x, y, default_w, default_h);
+    };
+    let (cx, cy) = clamp_picker_origin(x, y, ww, wh, ml, mt, mw, mh, 0, margin_y);
+    (cx, cy, ww, wh)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_picker_origin;
+
+    #[test]
+    fn clamp_picker_keeps_popup_inside_windows_5k_hidpi_monitor() {
+        // 5120x2880 at 200% scale: physical picker is 512x344, flush horizontal edge (0px), vertical margin 24px
+        let (cx, cy) =
+            clamp_picker_origin(5120 - 1, 2880 - 180, 512, 344, 0, 0, 5120, 2880, 0, 24);
+        assert_eq!(cx, 5120 - 512);
+        assert_eq!(cy, 2880 - 344 - 24);
+
+        let (lx, ly) = clamp_picker_origin(0, 4, 512, 344, 0, 0, 5120, 2880, 0, 24);
+        assert_eq!(lx, 0);
+        assert_eq!(ly, 24);
+    }
 }

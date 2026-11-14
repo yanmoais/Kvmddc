@@ -1024,6 +1024,7 @@ button.mac-form-row:hover {
 .edge-zone::before {
   content: "";
   position: absolute;
+  inset: -8px -14px;
   pointer-events: auto;
 }
 
@@ -1033,11 +1034,8 @@ button.mac-form-row:hover {
   transform: translate3d(-50%, 0, 0);
 }
 
-.pos-ext-top::before {
-  left: -120px;
-  top: -20px;
-  width: 240px;
-  height: 40px;
+.pos-ext-top[data-open="true"]::before {
+  inset: -10px -28px -16px -28px;
 }
 
 .pos-ext-seam {
@@ -1047,10 +1045,11 @@ button.mac-form-row:hover {
 }
 
 .pos-ext-seam::before {
-  left: -18px;
-  top: -86px;
-  width: 44px;
-  height: 172px;
+  inset: -14px -8px;
+}
+
+.pos-ext-seam[data-open="true"]::before {
+  inset: -24px -18px -24px -10px;
 }
 
 .pos-mbp-top {
@@ -1060,10 +1059,11 @@ button.mac-form-row:hover {
 }
 
 .pos-mbp-top::before {
-  left: -76px;
-  top: -20px;
-  width: 152px;
-  height: 36px;
+  inset: -8px -12px;
+}
+
+.pos-mbp-top[data-open="true"]::before {
+  inset: -16px -24px -10px -24px;
 }
 
 .edge-lip {
@@ -1864,6 +1864,7 @@ html.is-tauri-frameless .tray-body {
    -------------------------------------------------------------------------- */
 
 .picker-body {
+  min-height: 100vh;
   display: flex;
   align-items: flex-start;
   justify-content: center;
@@ -1872,6 +1873,10 @@ html.is-tauri-frameless .tray-body {
 
 html.is-tauri-frameless .picker-body {
   padding: 4px;
+}
+
+.picker-esc-btn {
+  cursor: pointer;
 }
 
 .picker-stage {
@@ -1915,10 +1920,11 @@ html.is-tauri-frameless .picker-body {
   font-size: 13px;
   font-weight: 500;
   color: var(--ink-1);
+  cursor: pointer;
   transition: background-color 110ms var(--ease-snap);
 }
 
-.picker-item:hover {
+.picker-item:hover:not(.picker-item-selected) {
   background: var(--row-hover-fill);
 }
 

@@ -8,6 +8,171 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalInputKind {
+    Mouse,
+    Keyboard,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ExternalInputDevice {
+    /// Hardware-scoped key used to diff hotplug arrivals/removals across polls.
+    pub device_key: String,
+    pub kind: ExternalInputKind,
+    pub product: String,
+    pub transport: String,
+}
+
+pub fn list_external_input_devices() -> Vec<ExternalInputDevice> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::list_external_input_devices()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::list_external_input_devices()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Vec::new()
+    }
+}
+
+pub fn classify_macos_hid_device(
+    built_in: Option<bool>,
+    transport: Option<&str>,
+    usage_page: Option<i64>,
+    usage: Option<i64>,
+    vendor_id: Option<i64>,
+    product_id: Option<i64>,
+    location_id: Option<i64>,
+    product: Option<&str>,
+) -> Option<ExternalInputDevice> {
+    if built_in == Some(true) {
+        return None;
+    }
+    let t_lower = transport.unwrap_or("").trim().to_ascii_lowercase();
+    let transport_tag = match t_lower.as_str() {
+        "usb" => "USB",
+        "bluetooth" | "bluetoothlowenergy" | "bluetooth low energy" => "Bluetooth",
+        _ => return None,
+    };
+    let kind = match (usage_page, usage) {
+        (Some(1), Some(2)) => ExternalInputKind::Mouse,
+        (Some(1), Some(6 | 7)) => ExternalInputKind::Keyboard,
+        _ => return None,
+    };
+    let vid = vendor_id.unwrap_or(0).max(0) as u32;
+    let pid = product_id.unwrap_or(0).max(0) as u32;
+    let loc = location_id.unwrap_or(0).max(0) as u64;
+    let product_name = product.unwrap_or("").trim().to_string();
+    if (vid == 0 && pid == 0 && product_name.is_empty())
+        || is_monitor_or_hub_vendor_hid(vid, pid, &product_name)
+    {
+        return None;
+    }
+    let kind_tag = match kind {
+        ExternalInputKind::Mouse => "mouse",
+        ExternalInputKind::Keyboard => "keyboard",
+    };
+    let scope = if loc != 0 {
+        format!("{loc:x}")
+    } else {
+        product_name.to_ascii_lowercase()
+    };
+    Some(ExternalInputDevice {
+        device_key: format!("mac:{kind_tag}:{t_lower}:{vid:04x}:{pid:04x}:{scope}"),
+        kind,
+        product: product_name,
+        transport: transport_tag.to_string(),
+    })
+}
+
+fn extract_windows_vid_pid(upper_path: &str) -> Option<String> {
+    for (v_pfx, p_pfx) in [("VID_", "PID_"), ("VID&", "PID&")] {
+        if let Some(v_idx) = upper_path.find(v_pfx) {
+            let vid = &upper_path[v_idx + v_pfx.len()..];
+            let vid_code: String = vid.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+            if !vid_code.is_empty() {
+                if let Some(p_idx) = upper_path.find(p_pfx) {
+                    let pid = &upper_path[p_idx + p_pfx.len()..];
+                    let pid_code: String = pid.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+                    if !pid_code.is_empty() {
+                        return Some(format!("VID_{vid_code} PID_{pid_code}"));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn classify_windows_raw_input_path(
+    dw_type: u32,
+    raw_path: &str,
+) -> Option<ExternalInputDevice> {
+    let kind = match dw_type {
+        0 => ExternalInputKind::Mouse,
+        1 => ExternalInputKind::Keyboard,
+        _ => return None,
+    };
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    const VIRTUAL_OR_INTERNAL_TOKENS: &[&str] = &[
+        "HID_DEVICE_SYSTEM_",
+        "ROOT\\",
+        "\\ROOT#",
+        "RDP_",
+        "TERMDD",
+        "VMBUS",
+        "SYNAPTICS",
+        "ELAN",
+        "ALPS",
+        "ACPI\\",
+        "\\ACPI#",
+        "PNP0303",
+        "VID_0000",
+        "VID_0BDA&PID_1100",
+    ];
+    if VIRTUAL_OR_INTERNAL_TOKENS
+        .iter()
+        .any(|tok| upper.contains(tok))
+    {
+        return None;
+    }
+    let has_hw_ids = (upper.contains("VID_") && upper.contains("PID_"))
+        || (upper.contains("VID&") && upper.contains("PID&"));
+    if !has_hw_ids {
+        return None;
+    }
+    let transport = if upper.contains("BTHENUM") || upper.contains("VID&") {
+        "Bluetooth"
+    } else {
+        "USB"
+    };
+    let kind_tag = match kind {
+        ExternalInputKind::Mouse => "mouse",
+        ExternalInputKind::Keyboard => "keyboard",
+    };
+    let normalized_path = trimmed
+        .split("#{")
+        .next()
+        .unwrap_or(trimmed)
+        .trim_start_matches("\\\\?\\")
+        .to_ascii_lowercase();
+    let product = extract_windows_vid_pid(&upper).unwrap_or_else(|| "External HID".to_string());
+    Some(ExternalInputDevice {
+        device_key: format!("win:{kind_tag}:{normalized_path}"),
+        kind,
+        product,
+        transport: transport.to_string(),
+    })
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisplayModeOption {
     pub mode_id: i32,
@@ -47,6 +212,28 @@ impl ConnectedMonitorProbe {
     }
 }
 
+/// Excludes USB-C monitor hubs and DDC vendor HID bridges that re-enumerate on wake or lid switches.
+fn is_monitor_or_hub_vendor_hid(vid: u32, pid: u32, product_name: &str) -> bool {
+    let upper = product_name.trim().to_ascii_uppercase();
+    (vid == 0x0bda && pid == 0x1100) || upper.contains("PHILIPS") || upper.contains("BILLBOARD")
+}
+
+/// Lists active non-loopback IPv4 addresses on local network interfaces in OS interface order.
+pub fn list_local_ipv4_addrs() -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::list_local_ipv4_addrs()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::list_local_ipv4_addrs()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Vec::new()
+    }
+}
+
 pub fn default_port_label_for_input(input: u8) -> &'static str {
     match input {
         21 => "USB-C",
@@ -72,6 +259,7 @@ pub struct PointerSample {
     pub screen_right: i32,
     pub screen_bottom: i32,
     pub ctrl_down: bool,
+    pub mouse_down: bool,
 }
 
 impl PointerSample {
@@ -315,6 +503,35 @@ pub fn wake_displays_and_wait() -> Result<bool> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Ok(true)
+    }
+}
+
+pub fn active_display_count() -> u32 {
+    #[cfg(target_os = "macos")]
+    {
+        macos::active_display_count()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        1
+    }
+}
+
+pub fn wake_idle_display_for_kvm() {
+    #[cfg(target_os = "macos")]
+    {
+        macos::wake_idle_display_for_kvm();
+    }
+}
+
+pub fn ensure_display_sleep_prevented(enabled: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        macos::ensure_display_sleep_prevented(enabled);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = enabled;
     }
 }
 
@@ -629,6 +846,35 @@ pub fn gather_external_windows_to_builtin() -> Result<()> {
     }
 }
 
+/// Restricts Mac pointer/edge bounds to the built-in display when the external 27" monitor is
+/// showing another host so a still-connected external link never creates an invisible `-X..0` trap.
+pub fn set_builtin_display_confined(confined: bool) {
+    #[cfg(target_os = "macos")]
+    macos::set_builtin_display_confined(confined);
+    #[cfg(target_os = "windows")]
+    windows::set_builtin_display_confined(confined);
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = confined;
+    }
+}
+
+/// Warps a stranded pointer from an external non-builtin display back onto the built-in display.
+pub fn clamp_cursor_to_builtin_if_needed() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::clamp_cursor_to_builtin_if_needed()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::clamp_cursor_to_builtin_if_needed()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        false
+    }
+}
+
 pub fn read_clipboard_png() -> Option<Vec<u8>> {
     #[cfg(target_os = "macos")]
     {
@@ -889,6 +1135,7 @@ mod tests {
             screen_right: 2560,
             screen_bottom: 1440,
             ctrl_down: true,
+            mouse_down: false,
         };
         assert_eq!(sample.near_edge(4), Some(EdgeSide::Right));
     }
@@ -940,5 +1187,130 @@ mod tests {
         let back_png = cf_dib_to_png(&dib).unwrap();
         let dib2 = png_to_cf_dib(&back_png).unwrap();
         assert_eq!(dib, dib2);
+    }
+
+    #[test]
+    fn display_sleep_assertion_toggles_cleanly() {
+        ensure_display_sleep_prevented(true);
+        let count = active_display_count();
+        assert!(count >= 1 || cfg!(not(target_os = "macos")));
+        ensure_display_sleep_prevented(false);
+    }
+
+    #[test]
+    fn classifies_external_hid_devices_and_ignores_builtin_and_virtual() {
+        // 1. Built-in MacBook keyboard/trackpad -> ignored
+        assert_eq!(
+            classify_macos_hid_device(
+                Some(true),
+                Some("FIFO"),
+                Some(1),
+                Some(6),
+                Some(0),
+                Some(0),
+                Some(0x11e),
+                Some("Apple Internal Keyboard / Trackpad"),
+            ),
+            None
+        );
+        // 2. Realtek monitor vendor-defined & standard-usage USB HID -> ignored
+        assert_eq!(
+            classify_macos_hid_device(
+                Some(false),
+                Some("USB"),
+                Some(65498),
+                Some(218),
+                Some(3034),
+                Some(4352),
+                Some(0x3140000),
+                Some("HID Device"),
+            ),
+            None
+        );
+        assert_eq!(
+            classify_macos_hid_device(
+                Some(false),
+                Some("USB"),
+                Some(1),
+                Some(6),
+                Some(0x0bda),
+                Some(0x1100),
+                Some(0x3140000),
+                Some("HID Device"),
+            ),
+            None
+        );
+        assert_eq!(
+            classify_windows_raw_input_path(
+                1,
+                r"\\?\HID#VID_0BDA&PID_1100&MI_00#7&1234&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}",
+            ),
+            None
+        );
+        for ip in list_local_ipv4_addrs() {
+            let parsed: std::net::Ipv4Addr = ip.parse().expect("valid IPv4 address");
+            assert!(!parsed.is_loopback() && !parsed.is_unspecified());
+        }
+        // 3. External Lenovo mouse & Gaming keyboard -> accepted cleanly
+        let mac_mouse = classify_macos_hid_device(
+            Some(false),
+            Some("USB"),
+            Some(1),
+            Some(2),
+            Some(6127),
+            Some(25125),
+            Some(0x120000),
+            Some("tp T50Pro"),
+        )
+        .unwrap();
+        assert_eq!(mac_mouse.kind, ExternalInputKind::Mouse);
+        assert_eq!(mac_mouse.transport, "USB");
+
+        let mac_kbd = classify_macos_hid_device(
+            None,
+            Some("USB"),
+            Some(1),
+            Some(6),
+            Some(9610),
+            Some(268),
+            Some(0x130000),
+            Some("Gaming Keyboard"),
+        )
+        .unwrap();
+        assert_eq!(mac_kbd.kind, ExternalInputKind::Keyboard);
+
+        // 4. Windows virtual VHF & RDP devices -> ignored
+        assert_eq!(
+            classify_windows_raw_input_path(
+                0,
+                r"\\?\HID#HID_DEVICE_SYSTEM_VHF&COL02#2&22ffef43&0&0001#{378de44c-56ef-11d1-bc8c-00a0c91405dd}",
+            ),
+            None
+        );
+        assert_eq!(
+            classify_windows_raw_input_path(
+                1,
+                r"\\?\Root#RDP_KBD#0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}",
+            ),
+            None
+        );
+
+        // 5. Real Windows USB Razer mouse & 2.4G receiver -> accepted with normalized keys
+        let win_mouse = classify_windows_raw_input_path(
+            0,
+            r"\\?\HID#VID_1532&PID_006E&MI_00#8&BA1A48B&0&0000#{378de44c-56ef-11d1-bc8c-00a0c91405dd}",
+        )
+        .unwrap();
+        assert_eq!(win_mouse.kind, ExternalInputKind::Mouse);
+        assert_eq!(win_mouse.transport, "USB");
+        assert!(win_mouse.device_key.contains("vid_1532&pid_006e"));
+
+        let win_kbd = classify_windows_raw_input_path(
+            1,
+            r"\\?\HID#VID_3554&PID_FA09&MI_00#A&C00B6F8&0&0000#{884b96c3-56ef-11d1-bc8c-00a0c91405dd}",
+        )
+        .unwrap();
+        assert_eq!(win_kbd.kind, ExternalInputKind::Keyboard);
+        assert!(win_kbd.device_key.contains("vid_3554&pid_fa09"));
     }
 }

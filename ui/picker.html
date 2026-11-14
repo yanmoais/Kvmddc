@@ -8,10 +8,10 @@
 </head>
 <body class="picker-body">
   <div class="picker-stage" id="picker-stage">
-    <div class="picker-card mac-popover" role="listbox" aria-label="切换目标电脑">
+    <div class="picker-card mac-popover" id="picker-card" role="listbox" aria-label="切换目标电脑">
       <div class="picker-header">
-        <span>松开 Ctrl 切入目标主机</span>
-        <kbd class="tray-kbd">Esc</kbd>
+        <span>滚轮或悬停 · 松开或点击切入</span>
+        <kbd class="tray-kbd picker-esc-btn" id="picker-esc" title="点击取消切换">Esc</kbd>
       </div>
       <div class="picker-list" id="picker-list"></div>
     </div>

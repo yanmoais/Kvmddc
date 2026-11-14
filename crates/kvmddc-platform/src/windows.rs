@@ -52,6 +52,14 @@ const INPUT_MOUSE: DWORD = 0;
 const INPUT_KEYBOARD: DWORD = 1;
 const KEYEVENTF_KEYUP: DWORD = 0x0002;
 const MOUSEEVENTF_MOVE: DWORD = 0x0001;
+const RIDI_DEVICENAME: UINT = 0x2000_0007;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RAWINPUTDEVICELIST {
+    h_device: HANDLE,
+    dw_type: DWORD,
+}
 
 const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
 const QDC_ONLY_ACTIVE_PATHS: u32 = 0x0000_0002;
@@ -320,6 +328,17 @@ extern "system" {
     fn GetClipboardData(u_format: UINT) -> HANDLE;
     fn SetClipboardData(u_format: UINT, h_mem: HANDLE) -> HANDLE;
     fn RegisterClipboardFormatW(lpsz_format: *const u16) -> UINT;
+    fn GetRawInputDeviceList(
+        p_raw_input_device_list: *mut RAWINPUTDEVICELIST,
+        pui_num_devices: *mut UINT,
+        cb_size: UINT,
+    ) -> UINT;
+    fn GetRawInputDeviceInfoW(
+        h_device: HANDLE,
+        ui_command: UINT,
+        p_data: *mut c_void,
+        pcb_size: *mut UINT,
+    ) -> UINT;
 }
 
 #[link(name = "kernel32")]
@@ -669,6 +688,9 @@ pub fn sample_pointer_and_ctrl() -> Option<PointerSample> {
             return None;
         }
         let ctrl_down = ((GetAsyncKeyState(VK_CONTROL) as u16) & 0x8000) != 0;
+        let mouse_down = ((GetAsyncKeyState(0x01) as u16) & 0x8000) != 0
+            || ((GetAsyncKeyState(0x02) as u16) & 0x8000) != 0
+            || ((GetAsyncKeyState(0x04) as u16) & 0x8000) != 0;
         Some(PointerSample {
             x: pt.x,
             y: pt.y,
@@ -677,6 +699,7 @@ pub fn sample_pointer_and_ctrl() -> Option<PointerSample> {
             screen_right: mi.rc_monitor.right,
             screen_bottom: mi.rc_monitor.bottom,
             ctrl_down,
+            mouse_down,
         })
     }
 }
@@ -1067,7 +1090,7 @@ fn is_being_remotely_controlled() -> bool {
     let now = std::time::Instant::now();
     if let Ok(guard) = REMOTE_SESSION_CACHE.lock() {
         if let Some((ts, cached)) = *guard {
-            if now.duration_since(ts) < Duration::from_millis(2400) {
+            if now.duration_since(ts) < Duration::from_millis(8000) {
                 return cached;
             }
         }
@@ -1406,4 +1429,133 @@ pub fn kill_other_kvmddc_instances() {
         .args(["/F", "/FI", &filter, "/IM", "kvmddc.exe"])
         .creation_flags(CREATE_NO_WINDOW)
         .status();
+}
+
+pub fn set_builtin_display_confined(_confined: bool) {}
+
+pub fn clamp_cursor_to_builtin_if_needed() -> bool {
+    false
+}
+
+pub fn list_external_input_devices() -> Vec<crate::ExternalInputDevice> {
+    let mut devices = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    unsafe {
+        let mut count: UINT = 0;
+        let elem_size = std::mem::size_of::<RAWINPUTDEVICELIST>() as UINT;
+        if GetRawInputDeviceList(std::ptr::null_mut(), &mut count, elem_size) == u32::MAX
+            || count == 0
+        {
+            return devices;
+        }
+        // Retry slightly larger buffer in case a device arrived between count query and read.
+        let mut raw_list = vec![
+            RAWINPUTDEVICELIST {
+                h_device: std::ptr::null_mut(),
+                dw_type: 0,
+            };
+            (count as usize).saturating_add(8)
+        ];
+        let mut cap = raw_list.len() as UINT;
+        let got = GetRawInputDeviceList(raw_list.as_mut_ptr(), &mut cap, elem_size);
+        if got == u32::MAX {
+            return devices;
+        }
+        let n = (got as usize).min(raw_list.len());
+        for entry in &raw_list[..n] {
+            if entry.dw_type != 0 && entry.dw_type != 1 {
+                continue;
+            }
+            let mut chars: UINT = 0;
+            let q = GetRawInputDeviceInfoW(
+                entry.h_device,
+                RIDI_DEVICENAME,
+                std::ptr::null_mut(),
+                &mut chars,
+            );
+            if q == u32::MAX || chars == 0 || chars > 4096 {
+                continue;
+            }
+            let mut buf = vec![0u16; (chars as usize).saturating_add(2)];
+            let mut buf_chars = buf.len() as UINT;
+            let read_res = GetRawInputDeviceInfoW(
+                entry.h_device,
+                RIDI_DEVICENAME,
+                buf.as_mut_ptr() as *mut c_void,
+                &mut buf_chars,
+            );
+            if read_res == u32::MAX {
+                continue;
+            }
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            let path = String::from_utf16_lossy(&buf[..end]);
+            if let Some(dev) = crate::classify_windows_raw_input_path(entry.dw_type, &path) {
+                if seen.insert(dev.device_key.clone()) {
+                    devices.push(dev);
+                }
+            }
+        }
+    }
+    devices.sort();
+    devices
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MibIpAddrRow {
+    dw_addr: DWORD,
+    dw_index: DWORD,
+    dw_mask: DWORD,
+    dw_bcast_addr: DWORD,
+    dw_reasm_size: DWORD,
+    unused1: WORD,
+    w_type: WORD,
+}
+
+#[link(name = "iphlpapi")]
+extern "system" {
+    fn GetIpAddrTable(
+        p_ip_addr_table: *mut c_void,
+        pdw_size: *mut DWORD,
+        b_order: BOOL,
+    ) -> DWORD;
+}
+
+/// Returns active non-loopback IPv4 addresses on Windows network interfaces (`GetIpAddrTable`).
+pub fn list_local_ipv4_addrs() -> Vec<String> {
+    const ERROR_INSUFFICIENT_BUFFER: DWORD = 122;
+    const MIB_IPADDR_DISCONNECTED: WORD = 0x0008;
+    const MIB_IPADDR_DELETED: WORD = 0x0040;
+
+    let mut out = Vec::new();
+    let mut size: DWORD = 0;
+    unsafe {
+        let first = GetIpAddrTable(std::ptr::null_mut(), &mut size, 0);
+        if (first != ERROR_INSUFFICIENT_BUFFER && first != 0) || size < 4 {
+            return out;
+        }
+        let mut buf = vec![0u8; size as usize + 64];
+        let mut buf_size = buf.len() as DWORD;
+        if GetIpAddrTable(buf.as_mut_ptr() as *mut c_void, &mut buf_size, 0) != 0 {
+            return out;
+        }
+        let count = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let row_size = std::mem::size_of::<MibIpAddrRow>();
+        let rows_ptr = buf.as_ptr().add(4) as *const MibIpAddrRow;
+        let max_rows = (buf.len().saturating_sub(4)) / row_size;
+        for idx in 0..count.min(max_rows) {
+            let row = *rows_ptr.add(idx);
+            if (row.w_type & (MIB_IPADDR_DISCONNECTED | MIB_IPADDR_DELETED)) != 0 {
+                continue;
+            }
+            let ip = std::net::Ipv4Addr::from(row.dw_addr.to_ne_bytes());
+            if !ip.is_unspecified() && !ip.is_loopback() {
+                let s = ip.to_string();
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    out
 }

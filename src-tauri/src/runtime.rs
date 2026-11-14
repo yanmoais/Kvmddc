@@ -4,7 +4,7 @@ use chrono::{Local, Utc};
 use kvmddc_core::{
     config::{
         color_preset_label, next_color_preset, validate_pure_lan_ip, AppConfig, HostNode,
-        HostPlatform,
+        HostPlatform, SharedClusterSettings, SharedSyncOutcome,
     },
     db::{NewSwitchRequest, StateDb, SwitchRequestRow, SwitchSource, VerifyOutcome},
     deskflow::{
@@ -20,11 +20,11 @@ use kvmddc_core::{
     wol::send_wol_broadcast,
 };
 use kvmddc_platform::{
-    default_port_label_for_input, ConnectedMonitorProbe, DisplayModeOption, EdgeSide,
-    MediaAdjustHotkey, StandbyWakeDetector,
+    default_port_label_for_input, list_external_input_devices, ConnectedMonitorProbe,
+    DisplayModeOption, EdgeSide, ExternalInputDevice, MediaAdjustHotkey, StandbyWakeDetector,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -77,6 +77,7 @@ pub struct DashboardStateDto {
     pub ctrl_edge_switch_enabled: bool,
     pub allow_plain_slide_to_internal: bool,
     pub unify_cross_os_modifiers: bool,
+    pub auto_switch_input_provider_on_hotplug: bool,
     pub observed_monitor_input: Option<u8>,
     pub preferred_brightness: u8,
     pub current_brightness: Option<u8>,
@@ -147,6 +148,7 @@ struct LiveState {
     peer_display_modes: HashMap<String, Vec<DisplayModeDto>>,
     peer_monitor_model: Option<String>,
     active_cursor_host: Option<String>,
+    deskflow_screen_host: Option<String>,
     observed_monitor_input: Option<u8>,
     current_brightness: Option<u8>,
     current_volume: Option<u8>,
@@ -159,13 +161,43 @@ struct LiveState {
     peer_clamshell_closed: HashMap<String, bool>,
     applied_slide_peer_id: Option<String>,
     applied_mouse_adjustment: Option<String>,
+    applied_confined_builtin: bool,
     last_switch_activity_at: Instant,
     secure_input_active: bool,
     last_error: Option<String>,
     peer_online: HashMap<String, bool>,
     picker_visible: bool,
+    picker_bounds: Option<(i32, i32, i32, i32)>,
     edge_candidates: Vec<EdgeCandidateDto>,
     hovered_candidate_id: Option<String>,
+}
+
+static FOCUS_FOLLOWUP_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static FOCUS_FOLLOWUP_TARGET: std::sync::Mutex<Option<String>> =
+    std::sync::Mutex::new(None);
+static CLIENT_REFOCUS_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PICKER_DISMISSED_SEQ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static LAST_PEER_SHAPE_CHANGE: std::sync::Mutex<Option<(String, Instant)>> =
+    std::sync::Mutex::new(None);
+
+fn sync_confine_builtin_flag(data_dir: &Path, confined: bool) {
+    let df_dir = data_dir.join("deskflow");
+    let flag_path = df_dir.join("confine_builtin.flag");
+    if confined {
+        let _ = std::fs::create_dir_all(&df_dir);
+        let _ = std::fs::write(&flag_path, b"1");
+    } else {
+        let _ = std::fs::remove_file(&flag_path);
+    }
+}
+
+/// Returns `true` when `probe` reports a normal desktop resolution (`>= 1280×720`) that the user
+/// chose in OS Display Settings, rather than a broken VGA/WinDisc fallback (`640×480`..`1024×768`).
+fn is_user_chosen_desktop_resolution(w: u32, h: u32) -> bool {
+    w >= 1280 && h >= 720
 }
 
 impl LiveState {
@@ -174,12 +206,23 @@ impl LiveState {
     /// - `allow_plain_slide_to_internal` is enabled, displays are awake, and no remote session lock is active;
     /// - an enabled laptop host (`has_internal_screen == true`) exists and its lid is OPEN (`!clamshell_closed`);
     /// - the 27" shared monitor is currently displaying a DIFFERENT online host (`peer.id != internal_host.id`).
+    /// Returns `true` when Deskflow on this host must pause because either this machine itself is
+    /// screen/secure-input locked, or the active cluster `input_provider` is locked. An idle 3rd
+    /// peer sitting at its lock screen must never freeze Deskflow between unlocked peers.
+    fn is_deskflow_session_locked(&self) -> bool {
+        self.edge_locked
+            || (!self.cfg.is_input_provider()
+                && self
+                    .peer_edge_locked
+                    .get(&self.cfg.input_provider_host_id)
+                    .copied()
+                    .unwrap_or(false))
+    }
+
     fn effective_plain_slide_peer_id(&self) -> Option<String> {
-        let peer_locked = self.peer_edge_locked.values().copied().any(|v| v);
         if !self.cfg.allow_plain_slide_to_internal
             || self.display_sleeping
-            || self.edge_locked
-            || peer_locked
+            || self.is_deskflow_session_locked()
         {
             return None;
         }
@@ -189,6 +232,16 @@ impl LiveState {
             .iter()
             .copied()
             .find(|h| h.display_profile.has_internal_screen)?;
+
+        let internal_locked = internal_host.id != self.cfg.local_host_id
+            && self
+                .peer_edge_locked
+                .get(&internal_host.id)
+                .copied()
+                .unwrap_or(false);
+        if internal_locked {
+            return None;
+        }
 
         let internal_lid_closed = if internal_host.id == self.cfg.local_host_id {
             self.clamshell_closed
@@ -208,8 +261,10 @@ impl LiveState {
         let active_input = self.observed_monitor_input.or_else(|| {
             if self.external_display_online {
                 self.local_probe.detected_input
-            } else {
+            } else if self.peer_detected_inputs.len() == 1 {
                 self.peer_detected_inputs.values().copied().next()
+            } else {
+                None
             }
         })?;
 
@@ -230,19 +285,113 @@ impl LiveState {
                 .copied()
                 .unwrap_or(false)
         };
-        if !monitor_host_online {
+        let monitor_host_locked = monitor_host.id != self.cfg.local_host_id
+            && self
+                .peer_edge_locked
+                .get(&monitor_host.id)
+                .copied()
+                .unwrap_or(false);
+        if !monitor_host_online || monitor_host_locked {
             return None;
         }
 
         Some(monitor_host.id.clone())
     }
 
+    /// Returns `true` when this laptop's lid is open, its external cable still enumerates the 27" monitor
+    /// as an extended desktop (`-X..0`), AND the 27" monitor is actually showing a different host.
+    /// Confining Deskflow & pointer edge math to the built-in display avoids invisible `-X..0` cursor traps.
+    fn should_confine_builtin_display(&self) -> bool {
+        let Ok(local) = self.cfg.local_host() else {
+            return false;
+        };
+        if !local.display_profile.has_internal_screen
+            || self.clamshell_closed
+            || !self.external_display_online
+        {
+            return false;
+        }
+        matches!(self.observed_monitor_input, Some(inp) if inp != local.monitor_input)
+    }
+
     fn should_reload_deskflow_links(&self) -> bool {
-        self.deskflow_running
-            && self.cfg.is_input_provider()
+        if !self.deskflow_running {
+            return false;
+        }
+        self.cfg.is_input_provider()
             && (self.effective_plain_slide_peer_id() != self.applied_slide_peer_id
                 || compute_deskflow_mouse_adjustment(&self.cfg, self.observed_monitor_input)
                     != self.applied_mouse_adjustment)
+    }
+
+    fn is_host_clamshell_closed(&self, host_id: &str) -> bool {
+        if host_id == self.cfg.local_host_id {
+            self.clamshell_closed
+        } else {
+            self.peer_clamshell_closed
+                .get(host_id)
+                .copied()
+                .unwrap_or(false)
+        }
+    }
+
+    /// When a laptop's lid is closed (`clamshell_closed == true`), it has no visible internal screen.
+    /// If the 27" monitor is showing another online host (`h.monitor_input == inp`), return `(host_id, hotkey_slot)`.
+    /// Note: any host actively displayed on the 27" monitor (`h.monitor_input == inp`) IS visible on that monitor.
+    fn monitor_escape_target_for_closed_laptop(&self, closed_host_id: &str) -> Option<(String, u8)> {
+        let inp = self.observed_monitor_input?;
+        let mh = self
+            .cfg
+            .hosts
+            .iter()
+            .find(|h| h.enabled && h.monitor_input == inp && h.id != closed_host_id)?;
+        let online = mh.id == self.cfg.local_host_id
+            || self.peer_online.get(&mh.id).copied().unwrap_or(false);
+        online.then(|| (mh.id.clone(), mh.hotkey_slot))
+    }
+
+    fn has_local_cursor_for_controls(&self) -> bool {
+        if !self.cfg.deskflow_enabled || self.is_deskflow_session_locked() {
+            return true;
+        }
+        let cursor_is_local = self
+            .active_cursor_host
+            .as_deref()
+            .map(|id| id == self.cfg.local_host_id)
+            .unwrap_or_else(|| self.cfg.is_input_provider());
+        if self.deskflow_connected {
+            return cursor_is_local;
+        }
+        if self.cfg.is_input_provider() {
+            return true;
+        }
+        // Client during a brief Server restart should keep relying on active_cursor_host rather
+        // than jumping to local=true mid-reload while the provider is still online.
+        let provider_online = self
+            .peer_online
+            .get(&self.cfg.input_provider_host_id)
+            .copied()
+            .unwrap_or(false);
+        if self.deskflow_running && provider_online {
+            cursor_is_local
+        } else {
+            true
+        }
+    }
+
+    fn apply_shared_reconcile(
+        &mut self,
+        incoming: &SharedClusterSettings,
+        source_host_id: &str,
+    ) -> (SharedSyncOutcome, bool) {
+        let outcome = self.cfg.reconcile_shared_settings(incoming, source_host_id);
+        let disabled_now = outcome.changed && !self.cfg.deskflow_enabled;
+        if disabled_now {
+            self.deskflow_running = false;
+            self.deskflow_connected = false;
+            self.active_cursor_host = Some(self.cfg.local_host_id.clone());
+        }
+        (outcome, disabled_now)
     }
 }
 
@@ -265,16 +414,24 @@ pub fn compute_deskflow_mouse_adjustment(
     let client_host = if remote_hosts.len() == 1 {
         remote_hosts[0]
     } else {
+        // When the 27" monitor is showing the local server host itself (or unknown),
+        // prefer a same-platform peer first so Mac<->Mac stays 1:1 instead of falling back to Windows 2.00x.
         observed_monitor_input
             .and_then(|inp| remote_hosts.iter().copied().find(|h| h.monitor_input == inp))
             .or_else(|| {
                 remote_hosts
                     .iter()
                     .copied()
-                    .find(|h| h.platform != server_host.platform)
+                    .find(|h| h.platform == server_host.platform)
             })
             .unwrap_or(remote_hosts[0])
     };
+
+    // Both macOS nodes report logical CoreGraphics HiDPI coordinates with identical native pointer
+    // acceleration; never downscale Mac<->Mac deltas (e.g. 1920/2560 = 0.75) or restart Deskflow between Macs.
+    if server_host.platform == HostPlatform::Macos && client_host.platform == HostPlatform::Macos {
+        return None;
+    }
 
     let sw = server_host.display_profile.preferred_width;
     let cw = client_host.display_profile.preferred_width;
@@ -326,7 +483,55 @@ pub fn default_data_dir() -> PathBuf {
     std::env::temp_dir().join("kvmddc-data")
 }
 
+fn is_routable_pure_lan_ipv4(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    let Ok(ip) = trimmed.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    !ip.is_loopback()
+        && !ip.is_unspecified()
+        && !ip.is_link_local()
+        && validate_pure_lan_ip(trimmed).is_ok()
+}
+
+fn select_preferred_local_pure_lan_ip(
+    configured_ip: Option<&str>,
+    active_ips: &[String],
+    routed_probe_ip: Option<&str>,
+    prefer_primary_nic: bool,
+) -> Option<String> {
+    let active_pure: Vec<String> = active_ips
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| is_routable_pure_lan_ipv4(s))
+        .collect();
+
+    if prefer_primary_nic {
+        if let Some(primary) = active_pure.first() {
+            return Some(primary.clone());
+        }
+    }
+
+    if let Some(cfg_ip) = configured_ip.map(str::trim).filter(|s| !s.is_empty()) {
+        if active_pure.iter().any(|ip| ip == cfg_ip) {
+            return Some(cfg_ip.to_string());
+        }
+    }
+
+    if let Some(probe) = routed_probe_ip.map(str::trim).filter(|s| !s.is_empty()) {
+        if is_routable_pure_lan_ipv4(probe) {
+            return Some(probe.to_string());
+        }
+    }
+
+    active_pure.into_iter().next()
+}
+
 fn detect_local_pure_lan_ip(cfg: &AppConfig) -> Option<String> {
+    let active_ips = kvmddc_platform::list_local_ipv4_addrs();
+    let configured_ip = cfg.local_host().ok().map(|h| h.lan_ip.as_str());
+    let mut routed_probe: Option<String> = None;
+
     let mut probe_targets: Vec<String> = cfg
         .hosts
         .iter()
@@ -343,13 +548,64 @@ fn detect_local_pure_lan_ip(cfg: &AppConfig) -> Option<String> {
         if sock.connect(&target).is_ok() {
             if let Ok(addr) = sock.local_addr() {
                 let ip_str = addr.ip().to_string();
-                if validate_pure_lan_ip(&ip_str).is_ok() {
-                    return Some(ip_str);
+                if is_routable_pure_lan_ipv4(&ip_str) {
+                    routed_probe = Some(ip_str);
+                    break;
                 }
             }
         }
     }
-    None
+
+    select_preferred_local_pure_lan_ip(
+        configured_ip,
+        &active_ips,
+        routed_probe.as_deref(),
+        cfg!(target_os = "macos"),
+    )
+}
+
+fn filter_pure_lan_candidate_ips(
+    addrs: impl IntoIterator<Item = std::net::SocketAddr>,
+    exclude_ip: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for addr in addrs {
+        if let std::net::SocketAddr::V4(v4) = addr {
+            let ip_str = v4.ip().to_string();
+            if ip_str != exclude_ip
+                && is_routable_pure_lan_ipv4(&ip_str)
+                && !out.contains(&ip_str)
+            {
+                out.push(ip_str);
+            }
+        }
+    }
+    out
+}
+
+async fn resolve_peer_mdns_ips(mdns: Option<&str>, exclude_ip: &str, port: u16) -> Vec<String> {
+    let Some(host) = mdns.map(str::trim).filter(|h| !h.is_empty()) else {
+        return Vec::new();
+    };
+    let Ok(Ok(addrs)) = tokio::time::timeout(
+        Duration::from_millis(800),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+    filter_pure_lan_candidate_ips(addrs, exclude_ip)
+}
+
+fn sort_edge_candidates_for_picker(
+    candidates: &mut [EdgeCandidateDto],
+    observed_monitor_input: Option<u8>,
+) {
+    candidates.sort_by_key(|c| {
+        let on_monitor_now = observed_monitor_input == Some(c.monitor_input);
+        (!c.online, on_monitor_now, c.hotkey_slot)
+    });
 }
 
 impl AppRuntime {
@@ -392,6 +648,15 @@ impl AppRuntime {
         db.ensure_runtime(&cfg.local_host_id, cfg.preferred_brightness, now)?;
         let _ = db.recover_after_restart(&cfg.local_host_id, now)?;
         let _ = db.prune_older_than_days(30, now)?;
+        let last_done_input = db.list_recent_requests(10).ok().and_then(|rows| {
+            rows.into_iter().find_map(|r| {
+                if matches!(r.status, kvmddc_core::db::SwitchStatus::Done) {
+                    r.observed_input.or(Some(r.target_input))
+                } else {
+                    None
+                }
+            })
+        });
 
         let mut peer_online = HashMap::new();
         peer_online.insert(cfg.local_host_id.clone(), true);
@@ -405,6 +670,7 @@ impl AppRuntime {
             client: LanControlClient::new()?,
             state: RwLock::new(LiveState {
                 active_cursor_host: Some(cfg.input_provider_host_id.clone()),
+                deskflow_screen_host: Some(cfg.local_host_id.clone()),
                 cfg,
                 deskflow_running: false,
                 deskflow_connected: false,
@@ -413,7 +679,7 @@ impl AppRuntime {
                 saved_ddc_brightness_before_sleep: None,
                 external_display_online: initial_probe.connected
                     || kvmddc_platform::has_external_display(),
-                observed_monitor_input: initial_probe.detected_input,
+                observed_monitor_input: initial_probe.detected_input.or(last_done_input),
                 local_probe: initial_probe,
                 local_display_modes: initial_modes,
                 peer_detected_inputs: HashMap::new(),
@@ -432,11 +698,13 @@ impl AppRuntime {
                 peer_clamshell_closed: HashMap::new(),
                 applied_slide_peer_id: None,
                 applied_mouse_adjustment: None,
+                applied_confined_builtin: false,
                 last_switch_activity_at: Instant::now() - Duration::from_secs(10),
                 secure_input_active: false,
                 last_error: None,
                 peer_online,
                 picker_visible: false,
+                picker_bounds: None,
                 edge_candidates: Vec::new(),
                 hovered_candidate_id: None,
             }),
@@ -517,10 +785,51 @@ impl AppRuntime {
         tokio::spawn(async move {
             s8.run_clipboard_image_sync_loop().await;
         });
+
+        let s9 = Arc::clone(self);
+        tokio::spawn(async move {
+            s9.run_hid_hotplug_loop().await;
+        });
+    }
+
+    async fn refresh_local_lan_ip_if_needed(&self) -> bool {
+        let fresh = {
+            let st = self.state.read().await;
+            detect_local_pure_lan_ip(&st.cfg)
+        };
+        let Some(new_ip) = fresh else {
+            return false;
+        };
+        let changed = {
+            let mut st = self.state.write().await;
+            let my_id = st.cfg.local_host_id.clone();
+            let mut updated = false;
+            if let Some(h) = st.cfg.hosts.iter_mut().find(|h| h.id == my_id) {
+                if h.lan_ip != new_ip {
+                    h.lan_ip = new_ip;
+                    updated = true;
+                }
+            }
+            if updated {
+                let _ = st.cfg.save(&self.data_dir);
+            }
+            updated
+        };
+        if changed {
+            self.deskflow_reload_notify.notify_one();
+        }
+        changed
     }
 
     async fn run_control_server_loop(self: Arc<Self>) {
         loop {
+            if self.refresh_local_lan_ip_if_needed().await {
+                let sync_rt = Arc::clone(&self);
+                tokio::spawn(async move {
+                    sync_rt.sync_peer_settings().await;
+                });
+            }
+
             let (lan_ip, port) = {
                 let st = self.state.read().await;
                 let ip = st
@@ -536,30 +845,37 @@ impl AppRuntime {
                     let handler: Arc<dyn ControlPlaneHandler> =
                         Arc::clone(&self) as Arc<dyn ControlPlaneHandler>;
                     let router = build_control_router(handler);
-                    let _ = axum::serve(listener, router).await;
-                }
-                Err(_) => {
-                    // Check whether DHCP assigned a new LAN IPv4 after reboot or Wi-Fi roam
-                    let changed_ip = {
-                        let mut st = self.state.write().await;
-                        let fresh = detect_local_pure_lan_ip(&st.cfg);
-                        let mut updated = false;
-                        if let Some(new_ip) = fresh {
-                            let my_id = st.cfg.local_host_id.clone();
-                            if let Some(h) = st.cfg.hosts.iter_mut().find(|h| h.id == my_id) {
-                                if h.lan_ip != new_ip {
-                                    h.lan_ip = new_ip;
-                                    updated = true;
+                    let bound_ip = lan_ip.clone();
+                    let watch_rt = Arc::clone(&self);
+                    tokio::select! {
+                        _ = axum::serve(listener, router) => {}
+                        _ = async move {
+                            loop {
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                                let preferred = {
+                                    let st = watch_rt.state.read().await;
+                                    detect_local_pure_lan_ip(&st.cfg)
+                                };
+                                let active_addrs = kvmddc_platform::list_local_ipv4_addrs();
+                                let bound_still_up =
+                                    active_addrs.iter().any(|ip| ip.trim() == bound_ip);
+                                let preferred_changed = preferred
+                                    .as_deref()
+                                    .map(|p| p != bound_ip)
+                                    .unwrap_or(false);
+                                if !bound_still_up || preferred_changed {
+                                    break;
                                 }
                             }
-                            if updated {
-                                let _ = st.cfg.save(&self.data_dir);
-                            }
-                        }
-                        updated
-                    };
-                    if changed_ip {
-                        self.deskflow_reload_notify.notify_one();
+                        } => {}
+                    }
+                }
+                Err(_) => {
+                    if self.refresh_local_lan_ip_if_needed().await {
+                        let sync_rt = Arc::clone(&self);
+                        tokio::spawn(async move {
+                            sync_rt.sync_peer_settings().await;
+                        });
                         continue;
                     }
                     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -570,35 +886,93 @@ impl AppRuntime {
 
     async fn run_deskflow_supervisor_loop(self: Arc<Self>) {
         loop {
-            let (cfg_snapshot, any_edge_locked, _ext_online, slide_peer, mouse_adj) = {
+            let (cfg_snapshot, any_edge_locked, _ext_online, slide_peer, mouse_adj, confine_builtin, entered_confined) = {
                 let mut st = self.state.write().await;
-                let peer_locked = st.peer_edge_locked.values().copied().any(|v| v);
+                let session_locked = st.is_deskflow_session_locked();
                 let sp = st.effective_plain_slide_peer_id();
                 let madj = compute_deskflow_mouse_adjustment(&st.cfg, st.observed_monitor_input);
+                let prev_confined = st.applied_confined_builtin;
+                let confine = st.should_confine_builtin_display();
                 st.applied_slide_peer_id = sp.clone();
                 st.applied_mouse_adjustment = madj.clone();
+                st.applied_confined_builtin = confine;
                 (
                     st.cfg.clone(),
-                    st.edge_locked || peer_locked,
+                    session_locked,
                     st.external_display_online || st.observed_monitor_input.is_some(),
                     sp,
                     madj,
+                    confine,
+                    confine && !prev_confined,
                 )
             };
 
+            kvmddc_platform::set_builtin_display_confined(confine_builtin);
+            sync_confine_builtin_flag(&self.data_dir, confine_builtin);
+            if entered_confined {
+                let _ = tokio::task::spawn_blocking(kvmddc_platform::clamp_cursor_to_builtin_if_needed).await;
+            }
+
             if !cfg_snapshot.deskflow_enabled || any_edge_locked {
-                let _ = tokio::task::spawn_blocking(kvmddc_platform::kill_orphan_deskflow_processes)
-                    .await;
+                let _ = tokio::task::spawn_blocking(|| {
+                    kvmddc_platform::ensure_display_sleep_prevented(false);
+                    kvmddc_platform::kill_orphan_deskflow_processes();
+                })
+                .await;
                 {
                     let mut st = self.state.write().await;
                     st.deskflow_running = false;
                     st.deskflow_connected = false;
                     st.applied_slide_peer_id = None;
                     st.applied_mouse_adjustment = None;
+                    st.applied_confined_builtin = false;
                     st.active_cursor_host = Some(st.cfg.local_host_id.clone());
                 }
                 self.deskflow_reload_notify.notified().await;
                 continue;
+            }
+
+            let active_displays = tokio::task::spawn_blocking(|| {
+                kvmddc_platform::ensure_display_sleep_prevented(true);
+                kvmddc_platform::active_display_count()
+            })
+            .await
+            .unwrap_or(1);
+            if active_displays == 0 {
+                // On headless / Studio nodes where macOS already timed out into Display Sleep, wait briefly
+                // for WindowServer to wake `CGGetActiveDisplayList` before launching `deskflow-core`.
+                for _ in 0..8 {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    let cnt = tokio::task::spawn_blocking(kvmddc_platform::active_display_count)
+                        .await
+                        .unwrap_or(0);
+                    if cnt > 0 {
+                        break;
+                    }
+                }
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                // Avoid a 5-second `deskflow-core` launch/crash loop when macOS Accessibility is
+                // not yet trusted on this machine; keep the display sleep assertion held and wait
+                // quietly until `run_display_guardian_loop` wakes us via `deskflow_reload_notify`.
+                let ax_trusted = tokio::task::spawn_blocking(kvmddc_platform::is_accessibility_trusted)
+                    .await
+                    .unwrap_or(false);
+                if !ax_trusted {
+                    {
+                        let mut st = self.state.write().await;
+                        st.accessibility_trusted = false;
+                        st.deskflow_running = false;
+                        st.deskflow_connected = false;
+                    }
+                    tokio::select! {
+                        _ = self.deskflow_reload_notify.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                    }
+                    continue;
+                }
             }
 
             let bin_res = resolve_deskflow_binary(&cfg_snapshot);
@@ -649,6 +1023,13 @@ impl AppRuntime {
 
             #[cfg(target_os = "macos")]
             {
+                cmd.env(
+                    "KVMDDC_CONFINED_BUILTIN_FLAG_FILE",
+                    self.data_dir.join("deskflow/confine_builtin.flag"),
+                );
+                if confine_builtin {
+                    cmd.env("KVMDDC_CONFINED_BUILTIN_ONLY", "1");
+                }
                 let shim = self.data_dir.join("bin/libtis_mainthread_shim.dylib");
                 if shim.exists() {
                     cmd.env("DYLD_INSERT_LIBRARIES", shim);
@@ -657,7 +1038,9 @@ impl AppRuntime {
 
             #[cfg(target_os = "windows")]
             {
-                cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+                // CREATE_NO_WINDOW | ABOVE_NORMAL_PRIORITY_CLASS so background HID injection
+                // never suffers desktop thread priority starvation.
+                cmd.creation_flags(0x0800_0000 | 0x0000_8000);
             }
 
             let Ok(mut child) = cmd.spawn() else {
@@ -670,34 +1053,36 @@ impl AppRuntime {
                 let mut st = self.state.write().await;
                 st.deskflow_running = true;
                 st.deskflow_connected = false;
+                st.deskflow_screen_host = Some(st.cfg.local_host_id.clone());
             }
 
+            let missing_event_tap = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let missing_display_shape = Arc::new(std::sync::atomic::AtomicBool::new(false));
             if let Some(stdout) = child.stdout.take() {
-                let rt_log = Arc::clone(&self);
-                tokio::spawn(async move {
-                    let mut lines = BufReader::new(stdout).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        rt_log.ingest_deskflow_log(&line).await;
-                    }
-                });
+                spawn_deskflow_output_reader(
+                    stdout,
+                    Arc::clone(&self),
+                    Arc::clone(&missing_event_tap),
+                    Arc::clone(&missing_display_shape),
+                );
             }
             if let Some(stderr) = child.stderr.take() {
-                let rt_err = Arc::clone(&self);
-                tokio::spawn(async move {
-                    let mut lines = BufReader::new(stderr).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        rt_err.ingest_deskflow_log(&line).await;
-                    }
-                });
+                spawn_deskflow_output_reader(
+                    stderr,
+                    Arc::clone(&self),
+                    Arc::clone(&missing_event_tap),
+                    Arc::clone(&missing_display_shape),
+                );
             }
 
-            tokio::select! {
+            let intentional_reload = tokio::select! {
                 _ = self.deskflow_reload_notify.notified() => {
                     let _ = child.kill().await;
                     let _ = tokio::task::spawn_blocking(kvmddc_platform::kill_orphan_deskflow_processes).await;
+                    true
                 }
-                _ = child.wait() => {}
-            }
+                _ = child.wait() => false,
+            };
 
             {
                 let mut st = self.state.write().await;
@@ -705,56 +1090,40 @@ impl AppRuntime {
                 st.deskflow_connected = false;
             }
             let _ = std::fs::remove_dir_all(&tmp_dir);
-            tokio::time::sleep(Duration::from_millis(600)).await;
+            if missing_display_shape.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = tokio::task::spawn_blocking(kvmddc_platform::wake_idle_display_for_kvm)
+                    .await;
+                tokio::select! {
+                    _ = self.deskflow_reload_notify.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(1500)) => {},
+                }
+            } else if missing_event_tap.load(std::sync::atomic::Ordering::Relaxed) {
+                tokio::select! {
+                    _ = self.deskflow_reload_notify.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                }
+            } else if intentional_reload {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+            }
         }
     }
 
     async fn ingest_deskflow_log(self: &Arc<Self>, line: &str) {
-        static CLIENT_REFOCUS_SEQ: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
-
         let Some(ev) = parse_deskflow_log_line(line) else {
             return;
         };
-        let mut refocus_target: Option<(String, u8)> = None;
-        {
+        let refocus_target = {
             let mut st = self.state.write().await;
-            match ev {
-                DeskflowLogEvent::Switched { to, .. } => {
-                    st.active_cursor_host = Some(to);
-                }
-                DeskflowLogEvent::ClientConnected => {
-                    st.deskflow_connected = true;
-                    if st.cfg.is_input_provider() {
-                        if let Some(tid) = st.active_cursor_host.clone() {
-                            if tid != st.cfg.local_host_id {
-                                if let Some(h) = st
-                                    .cfg
-                                    .hosts
-                                    .iter()
-                                    .find(|h| h.enabled && h.id == tid)
-                                {
-                                    refocus_target = Some((tid, h.hotkey_slot));
-                                }
-                            }
-                        }
-                    }
-                }
-                DeskflowLogEvent::ClientDisconnected => {
-                    st.deskflow_connected = false;
-                }
-                DeskflowLogEvent::EnteringScreen => {
-                    st.active_cursor_host = Some(st.cfg.local_host_id.clone());
-                }
-                DeskflowLogEvent::LeavingScreen => {}
-            }
-        }
+            st.apply_deskflow_log_event(ev)
+        };
 
         if let Some((expected_id, slot)) = refocus_target {
             let seq = CLIENT_REFOCUS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             let rt_ref = Arc::clone(self);
             tokio::spawn(async move {
-                for delay_ms in [180_u64, 550_u64] {
+                for delay_ms in [120_u64, 420_u64, 900_u64] {
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     if CLIENT_REFOCUS_SEQ.load(std::sync::atomic::Ordering::Relaxed) != seq {
                         break;
@@ -762,6 +1131,7 @@ impl AppRuntime {
                     let still_wants = {
                         let st = rt_ref.state.read().await;
                         st.active_cursor_host.as_deref() == Some(expected_id.as_str())
+                            && st.deskflow_screen_host.as_deref() != Some(expected_id.as_str())
                     };
                     if !still_wants {
                         break;
@@ -776,10 +1146,11 @@ impl AppRuntime {
     }
 
     async fn run_ddc_worker_loop(self: Arc<Self>) {
+        let mut last_input_probe = Instant::now() - Duration::from_secs(5);
         let mut last_idle_probe = Instant::now() - Duration::from_secs(10);
         let mut idle_probe_ticks: u32 = 0;
         loop {
-            let (is_ctrl, ctrl_id, settle_ms, pref_brightness, is_sleeping, need_extra_vcp) = {
+            let (is_ctrl, ctrl_id, settle_ms, pref_brightness, is_sleeping, need_extra_vcp, in_sw_grace) = {
                 let st = self.state.read().await;
                 (
                     st.cfg.is_ddc_controller(),
@@ -788,6 +1159,7 @@ impl AppRuntime {
                     st.cfg.preferred_brightness,
                     st.display_sleeping,
                     st.current_volume.is_none() || st.current_color_preset.is_none(),
+                    st.last_switch_activity_at.elapsed() < Duration::from_millis(1800),
                 )
             };
 
@@ -901,13 +1273,29 @@ impl AppRuntime {
                 continue;
             }
 
-            // Idle hardware state poll every 25s (skipped while in standby so 0% dim never overwrites user brightness)
-            if !is_sleeping && last_idle_probe.elapsed() >= Duration::from_secs(25) {
-                last_idle_probe = Instant::now();
-                let poll_extra = need_extra_vcp || idle_probe_ticks.is_multiple_of(6);
-                idle_probe_ticks = idle_probe_ticks.wrapping_add(1);
+            // Fast 1.1s VCP 0x60 input source poll (detects physical monitor OSD switch & follows focus)
+            // + full 25s idle brightness/volume/color-preset poll (skipped during standby or active switch).
+            let has_pending = self.db.has_pending_request(&ctrl_id).unwrap_or(false);
+            if !is_sleeping
+                && !has_pending
+                && !in_sw_grace
+                && last_input_probe.elapsed() >= Duration::from_millis(1100)
+            {
+                last_input_probe = Instant::now();
+                let do_full_probe = last_idle_probe.elapsed() >= Duration::from_secs(25);
+                let poll_extra = if do_full_probe {
+                    last_idle_probe = Instant::now();
+                    let extra = need_extra_vcp || idle_probe_ticks.is_multiple_of(6);
+                    idle_probe_ticks = idle_probe_ticks.wrapping_add(1);
+                    extra
+                } else {
+                    false
+                };
                 let probe = tokio::task::spawn_blocking(move || {
                     let input = kvmddc_platform::read_input_source().ok();
+                    if !do_full_probe {
+                        return (input, None, None, None);
+                    }
                     let mut bright = kvmddc_platform::read_brightness().ok();
                     // Auto-heal firmware brightness reset (e.g. Display P3 firmware reset to 100)
                     if let Some(cur_b) = bright {
@@ -931,16 +1319,67 @@ impl AppRuntime {
                 .unwrap_or((None, None, None, None));
 
                 if probe.0.is_some() || probe.1.is_some() || probe.2.is_some() || probe.3.is_some() {
-                    let reload_df = {
+                    let (reload_df, osd_focus, restore_presets) = {
                         let mut st = self.state.write().await;
+                        let mut osd_focus_target: Option<(String, u8)> = None;
+                        let mut presets_to_restore: Option<(Option<u8>, Option<u8>)> = None;
                         if !st.display_sleeping {
                             if let Some(inp) = probe.0 {
-                                if st.observed_monitor_input.is_some()
-                                    && st.observed_monitor_input != Some(inp)
-                                {
+                                let prev_obs = st.observed_monitor_input;
+                                if prev_obs != Some(inp) {
+                                    st.observed_monitor_input = Some(inp);
                                     st.last_switch_activity_at = Instant::now();
+                                    let confine = st.should_confine_builtin_display();
+                                    st.applied_confined_builtin = confine;
+                                    kvmddc_platform::set_builtin_display_confined(confine);
+                                    sync_confine_builtin_flag(&self.data_dir, confine);
+
+                                    if let Some(mh) = st
+                                        .cfg
+                                        .hosts
+                                        .iter()
+                                        .find(|h| h.enabled && h.monitor_input == inp)
+                                        .cloned()
+                                    {
+                                        let mh_online = mh.id == st.cfg.local_host_id
+                                            || st.peer_online.get(&mh.id).copied().unwrap_or(false);
+                                        // Any host actively displayed on the 27" external monitor (`mh.monitor_input == inp`)
+                                        // is visible there even when its built-in laptop lid is closed!
+                                        if st.cfg.deskflow_enabled
+                                            && mh_online
+                                            && (prev_obs.is_some()
+                                                || mh.id != st.cfg.local_host_id
+                                                || st.active_cursor_host.as_deref()
+                                                    != Some(mh.id.as_str()))
+                                        {
+                                            CLIENT_REFOCUS_SEQ
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            st.active_cursor_host = Some(mh.id.clone());
+                                            osd_focus_target = Some((mh.id.clone(), mh.hotkey_slot));
+                                        }
+                                        if prev_obs.is_some() {
+                                            let (hb, hcp) =
+                                                (mh.preferred_brightness, mh.preferred_color_preset);
+                                            let mut dirty = false;
+                                            if let Some(b) = hb {
+                                                st.cfg.preferred_brightness = b;
+                                                st.current_brightness = Some(b);
+                                                dirty = true;
+                                            }
+                                            if let Some(cp) = hcp {
+                                                st.cfg.preferred_color_preset = cp;
+                                                st.current_color_preset = Some(cp);
+                                                dirty = true;
+                                            }
+                                            if dirty {
+                                                let _ = st.cfg.save(&self.data_dir);
+                                            }
+                                            if hb.is_some() || hcp.is_some() {
+                                                presets_to_restore = Some((hb, hcp));
+                                            }
+                                        }
+                                    }
                                 }
-                                st.observed_monitor_input = Some(inp);
                             }
                             if let Some(b) = probe.1 {
                                 st.current_brightness = Some(b);
@@ -952,17 +1391,39 @@ impl AppRuntime {
                                 st.current_color_preset = Some(cp);
                             }
                         }
-                        st.should_reload_deskflow_links()
+                        (
+                            st.should_reload_deskflow_links(),
+                            osd_focus_target,
+                            presets_to_restore,
+                        )
                     };
                     if reload_df {
                         self.deskflow_reload_notify.notify_one();
+                    }
+                    if let Some((fid, fslot)) = osd_focus {
+                        self.focus_deskflow_on_host(&fid, fslot, &[350, 1100, 2200, 3400])
+                            .await;
+                    }
+                    if let Some((hb, hcp)) = restore_presets {
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(220)).await;
+                            let _ = tokio::task::spawn_blocking(move || {
+                                if let Some(b) = hb {
+                                    let _ = kvmddc_platform::write_brightness(b);
+                                }
+                                if let Some(cp) = hcp {
+                                    let _ = kvmddc_platform::write_color_preset(cp);
+                                }
+                            })
+                            .await;
+                        });
                     }
                 }
             }
 
             tokio::select! {
                 _ = self.ddc_notify.notified() => {},
-                _ = tokio::time::sleep(Duration::from_millis(1200)) => {},
+                _ = tokio::time::sleep(Duration::from_millis(950)) => {},
             }
         }
     }
@@ -1045,6 +1506,10 @@ impl AppRuntime {
                 }
                 VerifyOutcome::RetryWrite(_) | VerifyOutcome::SupersededByPending(_) => {}
             }
+            let confine = st.should_confine_builtin_display();
+            st.applied_confined_builtin = confine;
+            kvmddc_platform::set_builtin_display_confined(confine);
+            sync_confine_builtin_flag(&self.data_dir, confine);
             let reload_df = st.should_reload_deskflow_links();
             drop(st);
             if reload_df {
@@ -1097,34 +1562,62 @@ impl AppRuntime {
             };
 
             for peer in peers {
-                let status_res = self.client.status(&peer.lan_ip, port, &token).await;
+                let status_res = self.fetch_peer_status_with_mdns(&peer, port, &token).await;
 
                 match status_res {
                     Ok(remote) => {
                         let mut need_pair = false;
+                        let mut need_push_settings = false;
+                        let mut hide_picker_now = false;
                         let mut cfg_dirty = false;
                         let mut peer_lock_changed = false;
+                        let mut clamshell_rescue_slot: Option<u8> = None;
+                        let mut push_cfg_snapshot: Option<AppConfig> = None;
                         let local_should_reconnect_df;
                         {
                             let mut st = self.state.write().await;
+                            let incoming_shared = remote.to_shared_settings();
+                            let (sync_out, disabled_now) =
+                                st.apply_shared_reconcile(&incoming_shared, &remote.host_id);
+                            if sync_out.changed {
+                                cfg_dirty = true;
+                            }
+                            if sync_out.deskflow_reload_needed {
+                                peer_lock_changed = true;
+                            }
+                            if disabled_now {
+                                hide_picker_now = true;
+                            }
+                            if sync_out.push_back_to_source
+                                || st.cfg.shared_settings_rev > remote.shared_settings_rev
+                            {
+                                need_push_settings = true;
+                            }
+
+                            if st.cfg.is_input_provider()
+                                && st.deskflow_running
+                                && !remote.is_input_provider
+                                && remote.deskflow_connected
+                            {
+                                st.deskflow_connected = true;
+                            }
                             local_should_reconnect_df = !st.cfg.is_input_provider()
                                 && st.deskflow_running
                                 && !st.deskflow_connected
+                                && remote.host_id == st.cfg.input_provider_host_id
                                 && remote.is_input_provider
                                 && remote.deskflow_running;
                             st.peer_online.insert(peer.id.clone(), true);
-                            if st.peer_edge_locked.insert(peer.id.clone(), remote.edge_locked)
-                                != Some(remote.edge_locked)
-                            {
-                                peer_lock_changed = true;
-                            }
                             if st
-                                .peer_clamshell_closed
-                                .insert(peer.id.clone(), remote.clamshell_closed)
-                                != Some(remote.clamshell_closed)
+                                .peer_edge_locked
+                                .insert(peer.id.clone(), remote.edge_locked)
+                                .unwrap_or(false)
+                                != remote.edge_locked
                             {
                                 peer_lock_changed = true;
                             }
+                            st.peer_clamshell_closed
+                                .insert(peer.id.clone(), remote.clamshell_closed);
                             if remote.is_ddc_controller {
                                 if remote.observed_monitor_input.is_some() {
                                     st.observed_monitor_input = remote.observed_monitor_input;
@@ -1141,8 +1634,18 @@ impl AppRuntime {
                                 if remote.current_color_preset.is_some() {
                                     st.current_color_preset = remote.current_color_preset;
                                 }
+                            } else if st.observed_monitor_input.is_none()
+                                && remote.observed_monitor_input.is_some()
+                            {
+                                st.observed_monitor_input = remote.observed_monitor_input;
                             }
-                            if remote.is_input_provider && remote.active_cursor_host.is_some() {
+                            // Only accept cursor focus from the single synchronized input provider.
+                            if !st.cfg.is_input_provider()
+                                && remote.host_id == st.cfg.input_provider_host_id
+                                && remote.is_input_provider
+                                && remote.shared_settings_rev >= st.cfg.shared_settings_rev
+                                && remote.active_cursor_host.is_some()
+                            {
                                 st.active_cursor_host = remote.active_cursor_host;
                             }
                             if let Some(m) = remote.detected_monitor_model.clone() {
@@ -1161,14 +1664,33 @@ impl AppRuntime {
                                 st.peer_detected_modes.remove(&peer.id);
                             }
                             if !remote.display_modes.is_empty() {
+                                if let Some(active_m) = remote.display_modes.iter().find(|m| {
+                                    m.active && is_user_chosen_desktop_resolution(m.width, m.height)
+                                }) {
+                                    if let Some(h) =
+                                        st.cfg.hosts.iter_mut().find(|h| h.id == peer.id)
+                                    {
+                                        if h.display_profile.preferred_width != active_m.width
+                                            || h.display_profile.preferred_height != active_m.height
+                                            || (active_m.hz >= 50
+                                                && h.display_profile.preferred_hz != active_m.hz)
+                                        {
+                                            h.display_profile.preferred_width = active_m.width;
+                                            h.display_profile.preferred_height = active_m.height;
+                                            if active_m.hz >= 50 {
+                                                h.display_profile.preferred_hz = active_m.hz;
+                                            }
+                                            cfg_dirty = true;
+                                        }
+                                    }
+                                }
                                 st.peer_display_modes
                                     .insert(peer.id.clone(), remote.display_modes.clone());
                             }
                             if let Some(det_code) = remote.detected_monitor_input {
                                 st.peer_detected_inputs.insert(peer.id.clone(), det_code);
-                                if st.observed_monitor_input.is_none() && !st.external_display_online {
-                                    st.observed_monitor_input = Some(det_code);
-                                }
+                                // NOTE: never copy remote.detected_monitor_input into observed_monitor_input;
+                                // multi-host DP/HDMI cables always report connected ports even when inactive.
                                 if st.cfg.reconcile_detected_port(&peer.id, det_code, true) {
                                     cfg_dirty = true;
                                     need_pair = true;
@@ -1193,12 +1715,52 @@ impl AppRuntime {
                                     need_pair = true;
                                 }
                             }
+                            if st.cfg.is_input_provider()
+                                && st.cfg.deskflow_enabled
+                                && st.deskflow_running
+                                && st.last_switch_activity_at.elapsed()
+                                    >= Duration::from_millis(5000)
+                            {
+                                if let Some(cur_id) = st.active_cursor_host.clone() {
+                                    let cur_is_closed_laptop = st
+                                        .cfg
+                                        .hosts
+                                        .iter()
+                                        .any(|h| h.id == cur_id && h.display_profile.has_internal_screen)
+                                        && st.is_host_clamshell_closed(&cur_id);
+                                    if cur_is_closed_laptop {
+                                        if let Some((esc_id, esc_slot)) =
+                                            st.monitor_escape_target_for_closed_laptop(&cur_id)
+                                        {
+                                            st.active_cursor_host = Some(esc_id);
+                                            st.last_switch_activity_at = Instant::now();
+                                            clamshell_rescue_slot = Some(esc_slot);
+                                        }
+                                    }
+                                }
+                            }
                             if cfg_dirty {
                                 let _ = st.cfg.save(&self.data_dir);
                             }
+                            if need_push_settings {
+                                push_cfg_snapshot = Some(st.cfg.clone());
+                            }
+                            let confine = st.should_confine_builtin_display();
+                            st.applied_confined_builtin = confine;
+                            kvmddc_platform::set_builtin_display_confined(confine);
+                            sync_confine_builtin_flag(&self.data_dir, confine);
                             if st.should_reload_deskflow_links() {
                                 peer_lock_changed = true;
                             }
+                        }
+                        if hide_picker_now {
+                            self.hide_edge_picker().await;
+                        }
+                        if let Some(slot) = clamshell_rescue_slot {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                kvmddc_platform::trigger_internal_deskflow_slot(slot)
+                            })
+                            .await;
                         }
                         if peer_lock_changed {
                             self.deskflow_reload_notify.notify_one();
@@ -1215,25 +1777,15 @@ impl AppRuntime {
                         }
                         let need_ip_announce =
                             peer_announced_ip.get(&peer.id) != Some(&local_ip);
-                        if need_pair || peer.tls_fingerprint.is_none() || need_ip_announce {
+                        if need_push_settings || need_pair || peer.tls_fingerprint.is_none() || need_ip_announce {
+                            let pair_req = if let Some(ref cfg_snap) = push_cfg_snapshot {
+                                PairPeerRequest::from_config(cfg_snap, local_ip.clone(), my_fp.clone())
+                            } else {
+                                PairPeerRequest::announce_only(local_id.clone(), local_ip.clone(), my_fp.clone())
+                            };
                             if self
                                 .client
-                                .pair(
-                                    &peer.lan_ip,
-                                    port,
-                                    &token,
-                                    &PairPeerRequest {
-                                        host_id: local_id.clone(),
-                                        lan_ip: local_ip.clone(),
-                                        tls_fingerprint: my_fp.clone(),
-                                        mac_address: None,
-                                        input_provider_host_id: None,
-                                        deskflow_enabled: None,
-                                        ctrl_edge_switch_enabled: None,
-                                        allow_plain_slide_to_internal: None,
-                                        unify_cross_os_modifiers: None,
-                                    },
-                                )
+                                .pair(&peer.lan_ip, port, &token, &pair_req)
                                 .await
                                 .is_ok()
                             {
@@ -1259,7 +1811,7 @@ impl AppRuntime {
                 }
             }
 
-            tokio::time::sleep(Duration::from_millis(2500)).await;
+            tokio::time::sleep(Duration::from_millis(1200)).await;
         }
     }
 
@@ -1284,9 +1836,15 @@ impl AppRuntime {
             let (locked, clamshell, sec_in, probe, modes, ax_ok, next_sig) =
                 tokio::task::spawn_blocking(move || {
                     let mut p = kvmddc_platform::probe_connected_monitor();
-                    if pref_w > 0
+                    // Only heal broken VGA/EDID fallbacks (< 1280×720). Never overwrite a valid
+                    // desktop resolution that the user chose in macOS / Windows Display Settings!
+                    let broken_fallback = p
+                        .active_width
+                        .zip(p.active_height)
+                        .is_some_and(|(w, h)| !is_user_chosen_desktop_resolution(w, h));
+                    if is_user_chosen_desktop_resolution(pref_w, pref_h)
                         && p.connected
-                        && (p.active_width != Some(pref_w) || p.active_height != Some(pref_h))
+                        && broken_fallback
                     {
                         if let Ok(Some(_)) =
                             kvmddc_platform::heal_display_profile(pref_w, pref_h, pref_hz)
@@ -1324,6 +1882,7 @@ impl AppRuntime {
 
             let ext_online = probe.connected;
             let mut reload_df = false;
+            let mut lid_escape: Option<(String, u8, Option<(String, u16, String)>)> = None;
             {
                 let mut st = self.state.write().await;
                 if !st.accessibility_trusted && ax_ok {
@@ -1335,14 +1894,38 @@ impl AppRuntime {
                 if st.external_display_online != ext_online {
                     st.external_display_online = ext_online;
                 }
+                let my_id = st.cfg.local_host_id.clone();
+                let mut cfg_dirty = false;
                 if let Some(det_in) = probe.detected_input {
                     if st.observed_monitor_input.is_none() {
                         st.observed_monitor_input = Some(det_in);
                     }
-                    let my_id = st.cfg.local_host_id.clone();
                     if st.cfg.reconcile_detected_port(&my_id, det_in, false) {
-                        let _ = st.cfg.save(&self.data_dir);
+                        cfg_dirty = true;
                     }
+                }
+                if probe.connected {
+                    if let (Some(w), Some(h)) = (probe.active_width, probe.active_height) {
+                        if is_user_chosen_desktop_resolution(w, h) {
+                            let hz = probe.active_hz.unwrap_or(0);
+                            if let Some(lh) = st.cfg.hosts.iter_mut().find(|n| n.id == my_id) {
+                                if lh.display_profile.preferred_width != w
+                                    || lh.display_profile.preferred_height != h
+                                    || (hz >= 50 && lh.display_profile.preferred_hz != hz)
+                                {
+                                    lh.display_profile.preferred_width = w;
+                                    lh.display_profile.preferred_height = h;
+                                    if hz >= 50 {
+                                        lh.display_profile.preferred_hz = hz;
+                                    }
+                                    cfg_dirty = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if cfg_dirty {
+                    let _ = st.cfg.save(&self.data_dir);
                 }
                 st.local_probe = probe;
                 if !modes.is_empty() {
@@ -1356,20 +1939,37 @@ impl AppRuntime {
                 {
                     st.last_error = None;
                 }
-                // If lid just closed while 27" monitor is showing an online remote host,
-                // local laptop has zero visible screens left -> move cursor focus to that monitor host.
-                if !was_clamshell && clamshell && st.cfg.is_input_provider() && !ext_online {
-                    if let Some(inp) = st.observed_monitor_input {
-                        if let Some(mh) = st
-                            .cfg
-                            .hosts
-                            .iter()
-                            .find(|h| h.enabled && h.monitor_input == inp && h.id != st.cfg.local_host_id)
+                // If lid just closed while 27" monitor is showing another online host (even if
+                // USB-C keeps ext_online=true without sleep), immediately hand focus to that host.
+                if !was_clamshell && clamshell && st.cfg.deskflow_enabled {
+                    let local_id = st.cfg.local_host_id.clone();
+                    let cur_on_laptop = st
+                        .active_cursor_host
+                        .as_deref()
+                        .map(|id| id == local_id)
+                        .unwrap_or(true);
+                    if cur_on_laptop {
+                        if let Some((esc_id, esc_slot)) =
+                            st.monitor_escape_target_for_closed_laptop(&local_id)
                         {
-                            let online = st.peer_online.get(&mh.id).copied().unwrap_or(false);
-                            if online {
-                                st.active_cursor_host = Some(mh.id.clone());
-                            }
+                            st.active_cursor_host = Some(esc_id.clone());
+                            st.last_switch_activity_at = Instant::now();
+                            let remote_provider = if st.cfg.is_input_provider() {
+                                None
+                            } else {
+                                st.cfg
+                                    .hosts
+                                    .iter()
+                                    .find(|h| h.id == st.cfg.input_provider_host_id && h.enabled)
+                                    .map(|h| {
+                                        (
+                                            h.lan_ip.clone(),
+                                            st.cfg.control_port,
+                                            st.cfg.shared_token.clone(),
+                                        )
+                                    })
+                            };
+                            lid_escape = Some((esc_id, esc_slot, remote_provider));
                         }
                     }
                 }
@@ -1377,10 +1977,36 @@ impl AppRuntime {
                     st.edge_locked = locked;
                     reload_df = true;
                 }
+                let confine = st.should_confine_builtin_display();
+                st.applied_confined_builtin = confine;
+                kvmddc_platform::set_builtin_display_confined(confine);
+                sync_confine_builtin_flag(&self.data_dir, confine);
                 if st.should_reload_deskflow_links() {
                     reload_df = true;
                 }
                 st.secure_input_active = sec_in;
+            }
+
+            if let Some((esc_id, esc_slot, remote_provider)) = lid_escape {
+                if let Some((prov_ip, port, token)) = remote_provider {
+                    let _ = self
+                        .client
+                        .focus_input(
+                            &prov_ip,
+                            port,
+                            &token,
+                            &FocusInputRequest {
+                                target_host_id: esc_id,
+                                hotkey_slot: esc_slot,
+                            },
+                        )
+                        .await;
+                } else {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        kvmddc_platform::trigger_internal_deskflow_slot(esc_slot)
+                    })
+                    .await;
+                }
             }
 
             if reload_df {
@@ -1395,7 +2021,11 @@ impl AppRuntime {
         let mut edge_since: Option<(EdgeSide, Instant)> = None;
         let mut last_triggered = Instant::now() - Duration::from_secs(5);
         let mut require_rearm = false;
+        let mut require_ctrl_release = false;
         let mut prev_local_cursor = true;
+        let mut prev_mouse_down = false;
+        let mut seen_dismissed_seq =
+            PICKER_DISMISSED_SEQ.load(std::sync::atomic::Ordering::Relaxed);
 
         loop {
             if let Some(slot) = kvmddc_platform::poll_user_hotkey_slot() {
@@ -1425,16 +2055,8 @@ impl AppRuntime {
             if let Some(media_hk) = kvmddc_platform::poll_media_adjust_hotkey() {
                 let (act_here, cur_b, cur_v, cur_m) = {
                     let st = self.state.read().await;
-                    let local_cursor = if st.deskflow_connected {
-                        st.active_cursor_host
-                            .as_deref()
-                            .map(|id| id == st.cfg.local_host_id)
-                            .unwrap_or(true)
-                    } else {
-                        true
-                    };
                     (
-                        local_cursor,
+                        st.has_local_cursor_for_controls(),
                         st.current_brightness.unwrap_or(st.cfg.preferred_brightness),
                         st.current_volume.unwrap_or(st.cfg.preferred_volume),
                         st.cfg.audio_muted,
@@ -1479,38 +2101,47 @@ impl AppRuntime {
 
             let (
                 dwell_ms,
+                switch_delay_ms,
                 ctrl_edge_active,
                 picker_open,
-                chosen_on_release,
+                picker_bounds,
                 has_local_cursor,
                 in_switch_cooldown,
+                confine_builtin,
+                plain_slide_active,
             ) = {
                 let st = self.state.read().await;
-                let any_locked =
-                    st.edge_locked || st.peer_edge_locked.values().copied().any(|v| v);
+                let any_locked = st.is_deskflow_session_locked();
                 let mon_ready =
                     st.external_display_online || st.observed_monitor_input.is_some();
-                let local_cursor = if st.deskflow_connected {
-                    st.active_cursor_host
-                        .as_deref()
-                        .map(|id| id == st.cfg.local_host_id)
-                        .unwrap_or(true)
-                } else {
-                    true
-                };
+                let local_cursor = st.has_local_cursor_for_controls();
                 (
                     st.cfg.ctrl_edge_dwell_ms,
+                    st.cfg.deskflow_switch_delay_ms,
                     st.cfg.deskflow_enabled
                         && st.cfg.ctrl_edge_switch_enabled
                         && !any_locked
                         && !st.display_sleeping
                         && mon_ready,
                     st.picker_visible,
-                    st.hovered_candidate_id.clone(),
+                    st.picker_bounds,
                     local_cursor,
                     st.last_switch_activity_at.elapsed() < Duration::from_millis(4500),
+                    st.should_confine_builtin_display(),
+                    st.effective_plain_slide_peer_id().is_some(),
                 )
             };
+
+            let cur_dismissed_seq =
+                PICKER_DISMISSED_SEQ.load(std::sync::atomic::Ordering::Relaxed);
+            if cur_dismissed_seq != seen_dismissed_seq {
+                seen_dismissed_seq = cur_dismissed_seq;
+                require_rearm = true;
+                require_ctrl_release = true;
+                edge_since = None;
+            }
+
+            kvmddc_platform::set_builtin_display_confined(confine_builtin);
 
             if !prev_local_cursor && has_local_cursor {
                 // Cursor just landed on this host (often parked at x=0/right edge); require clean Ctrl/edge release before arming
@@ -1528,22 +2159,71 @@ impl AppRuntime {
                     self.hide_edge_picker().await;
                 }
                 edge_since = None;
-            } else if let Some(sample) = kvmddc_platform::sample_pointer_and_ctrl() {
-                if require_rearm && (!sample.ctrl_down || sample.near_edge(16).is_none()) {
+                prev_mouse_down = false;
+            } else if let Some(mut sample) = kvmddc_platform::sample_pointer_and_ctrl() {
+                if confine_builtin
+                    && has_local_cursor
+                    && !in_switch_cooldown
+                    && (!plain_slide_active || sample.ctrl_down)
+                    && (sample.x < sample.screen_left
+                        || sample.x >= sample.screen_right
+                        || sample.y < sample.screen_top
+                        || sample.y >= sample.screen_bottom)
+                {
+                    if kvmddc_platform::clamp_cursor_to_builtin_if_needed() {
+                        if let Some(updated) = kvmddc_platform::sample_pointer_and_ctrl() {
+                            sample = updated;
+                        }
+                    }
+                }
+                if !sample.ctrl_down {
+                    require_ctrl_release = false;
+                }
+                if require_rearm
+                    && !require_ctrl_release
+                    && (!sample.ctrl_down || sample.near_edge(16).is_none())
+                {
                     require_rearm = false;
                 }
 
-                if picker_open && !sample.ctrl_down {
-                    self.hide_edge_picker().await;
-                    if let Some(tid) = chosen_on_release {
+                let mouse_just_pressed = sample.mouse_down && !prev_mouse_down;
+                prev_mouse_down = sample.mouse_down;
+
+                let clicked_outside_picker = picker_open
+                    && mouse_just_pressed
+                    && picker_bounds.is_some_and(|(l, t, r, b)| {
+                        sample.x < l || sample.x >= r || sample.y < t || sample.y >= b
+                    });
+
+                if clicked_outside_picker {
+                    self.cancel_edge_picker().await;
+                    seen_dismissed_seq =
+                        PICKER_DISMISSED_SEQ.load(std::sync::atomic::Ordering::Relaxed);
+                    require_rearm = true;
+                    require_ctrl_release = true;
+                    edge_since = None;
+                } else if picker_open && !sample.ctrl_down {
+                    if let Some(tid) = self.release_confirm_edge_picker().await {
                         let _ = self.orchestrate_switch(&tid, SwitchSource::EdgePicker).await;
                         last_triggered = Instant::now();
                         require_rearm = true;
                     }
+                    seen_dismissed_seq =
+                        PICKER_DISMISSED_SEQ.load(std::sync::atomic::Ordering::Relaxed);
                     edge_since = None;
-                } else if sample.ctrl_down && has_local_cursor && !in_switch_cooldown && !require_rearm {
+                } else if sample.ctrl_down
+                    && has_local_cursor
+                    && !in_switch_cooldown
+                    && !require_rearm
+                    && !require_ctrl_release
+                {
+                    let edge_margin = if sample.screen_right - sample.screen_left >= 3840 {
+                        8
+                    } else {
+                        4
+                    };
                     if let Some(side) = sample
-                        .near_edge(4)
+                        .near_edge(edge_margin)
                         .filter(|&s| kvmddc_platform::is_outer_desktop_edge(sample.x, sample.y, s))
                     {
                         let start = match edge_since {
@@ -1555,7 +2235,15 @@ impl AppRuntime {
                             }
                         };
 
-                        let effective_dwell_ms = dwell_ms.max(420);
+                        // Trigger Ctrl edge slightly faster than Deskflow's switchDelay so
+                        // Ctrl+push opens Edge Picker instead of plain-sliding across the seam.
+                        let effective_dwell_ms = if plain_slide_active {
+                            dwell_ms
+                                .min((switch_delay_ms as u64).saturating_sub(30))
+                                .clamp(70, 220)
+                        } else {
+                            dwell_ms.clamp(140, 220)
+                        };
                         if !picker_open
                             && start.elapsed() >= Duration::from_millis(effective_dwell_ms)
                             && last_triggered.elapsed() >= Duration::from_millis(1800)
@@ -1564,17 +2252,22 @@ impl AppRuntime {
                             if candidates.len() == 1 {
                                 last_triggered = Instant::now();
                                 require_rearm = true;
+                                require_ctrl_release = true;
                                 edge_since = None;
                                 let _ = self
                                     .orchestrate_switch(&candidates[0].id, SwitchSource::CtrlEdge)
                                     .await;
                             } else if candidates.len() >= 2 {
+                                // Align flush to active screen edge so the cursor at x=0 / right-1
+                                // immediately sits inside the picker window for instant wheel scroll.
                                 let popup_x = match side {
-                                    EdgeSide::Left => sample.screen_left + 16,
-                                    EdgeSide::Right => (sample.screen_right - 264).max(sample.screen_left + 16),
+                                    EdgeSide::Left => sample.screen_left,
+                                    EdgeSide::Right => sample.screen_right - 1,
                                 };
-                                let popup_y = (sample.y - 72)
-                                    .clamp(sample.screen_top + 24, (sample.screen_bottom - 180).max(sample.screen_top + 24));
+                                let popup_y = (sample.y - 58).clamp(
+                                    sample.screen_top + 12,
+                                    (sample.screen_bottom - 180).max(sample.screen_top + 12),
+                                );
                                 self.show_edge_picker(candidates, popup_x, popup_y).await;
                             }
                         }
@@ -1606,11 +2299,13 @@ impl AppRuntime {
             .collect()
     }
 
-    async fn show_edge_picker(&self, candidates: Vec<EdgeCandidateDto>, x: i32, y: i32) {
+    async fn show_edge_picker(&self, mut candidates: Vec<EdgeCandidateDto>, x: i32, y: i32) {
         {
             let mut st = self.state.write().await;
+            sort_edge_candidates_for_picker(&mut candidates, st.observed_monitor_input);
             st.hovered_candidate_id = candidates.first().map(|c| c.id.clone());
             st.edge_candidates = candidates;
+            st.picker_bounds = Some((x, y, x + 256, y + 172));
             st.picker_visible = true;
         }
         if let Some(cb) = self.picker_cb.read().await.as_ref() {
@@ -1618,14 +2313,56 @@ impl AppRuntime {
         }
     }
 
+    pub async fn set_picker_bounds(&self, bounds: (i32, i32, i32, i32)) {
+        let mut st = self.state.write().await;
+        if st.picker_visible {
+            st.picker_bounds = Some(bounds);
+        }
+    }
+
     pub async fn hide_edge_picker(&self) {
         {
             let mut st = self.state.write().await;
             st.picker_visible = false;
+            st.picker_bounds = None;
         }
         if let Some(cb) = self.picker_cb.read().await.as_ref() {
             cb(EdgePickerSignal::Hide);
         }
+    }
+
+    pub async fn cancel_edge_picker(&self) {
+        let was_visible = {
+            let mut st = self.state.write().await;
+            let vis = st.picker_visible;
+            st.picker_visible = false;
+            st.picker_bounds = None;
+            st.hovered_candidate_id = None;
+            vis
+        };
+        PICKER_DISMISSED_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if was_visible {
+            if let Some(cb) = self.picker_cb.read().await.as_ref() {
+                cb(EdgePickerSignal::Hide);
+            }
+        }
+    }
+
+    async fn release_confirm_edge_picker(&self) -> Option<String> {
+        let chosen = {
+            let mut st = self.state.write().await;
+            if !st.picker_visible {
+                return None;
+            }
+            st.picker_visible = false;
+            st.picker_bounds = None;
+            st.hovered_candidate_id.take()
+        };
+        PICKER_DISMISSED_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(cb) = self.picker_cb.read().await.as_ref() {
+            cb(EdgePickerSignal::Hide);
+        }
+        chosen
     }
 
     pub async fn get_edge_candidates(&self) -> Vec<EdgeCandidateDto> {
@@ -1639,14 +2376,99 @@ impl AppRuntime {
 
     pub async fn hover_edge_candidate(&self, host_id: String) {
         let mut st = self.state.write().await;
-        st.hovered_candidate_id = Some(host_id);
+        if st.picker_visible {
+            st.hovered_candidate_id = Some(host_id);
+        }
     }
 
     pub async fn confirm_edge_pick(&self, host_id: String) -> Result<DashboardStateDto> {
-        self.hide_edge_picker().await;
-        self.orchestrate_switch(&host_id, SwitchSource::EdgePicker)
-            .await?;
+        let should_switch = {
+            let mut st = self.state.write().await;
+            let vis = st.picker_visible;
+            st.picker_visible = false;
+            st.picker_bounds = None;
+            st.hovered_candidate_id = None;
+            vis
+        };
+        PICKER_DISMISSED_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(cb) = self.picker_cb.read().await.as_ref() {
+            cb(EdgePickerSignal::Hide);
+        }
+        if should_switch {
+            self.orchestrate_switch(&host_id, SwitchSource::EdgePicker)
+                .await?;
+        }
         self.dashboard_snapshot().await
+    }
+
+    async fn focus_deskflow_on_host(
+        &self,
+        target_host_id: &str,
+        slot: u8,
+        followups_ms: &'static [u64],
+    ) {
+        let (df_on, is_provider, provider_opt, port, token) = {
+            let st = self.state.read().await;
+            let prov = st
+                .cfg
+                .hosts
+                .iter()
+                .find(|h| h.id == st.cfg.input_provider_host_id && h.enabled)
+                .map(|h| h.lan_ip.clone());
+            (
+                st.cfg.deskflow_enabled,
+                st.cfg.is_input_provider(),
+                prov,
+                st.cfg.control_port,
+                st.cfg.shared_token.clone(),
+            )
+        };
+        if !df_on {
+            return;
+        }
+        CLIENT_REFOCUS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut guard) = FOCUS_FOLLOWUP_TARGET.lock() {
+            *guard = Some(target_host_id.to_string());
+        }
+        let focus_seq = FOCUS_FOLLOWUP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if is_provider {
+            let _ = tokio::task::spawn_blocking(move || {
+                kvmddc_platform::trigger_internal_deskflow_slot(slot)
+            })
+            .await;
+            if !followups_ms.is_empty() {
+                tokio::spawn(async move {
+                    let mut prev_ms = 0_u64;
+                    for &at_ms in followups_ms {
+                        let wait_ms = at_ms.saturating_sub(prev_ms);
+                        prev_ms = at_ms;
+                        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                        if FOCUS_FOLLOWUP_SEQ.load(std::sync::atomic::Ordering::Relaxed)
+                            != focus_seq
+                        {
+                            break;
+                        }
+                        let _ = tokio::task::spawn_blocking(move || {
+                            kvmddc_platform::trigger_internal_deskflow_slot(slot)
+                        })
+                        .await;
+                    }
+                });
+            }
+        } else if let Some(prov_ip) = provider_opt {
+            let _ = self
+                .client
+                .focus_input(
+                    &prov_ip,
+                    port,
+                    &token,
+                    &FocusInputRequest {
+                        target_host_id: target_host_id.to_string(),
+                        hotkey_slot: slot,
+                    },
+                )
+                .await;
+        }
     }
 
     pub async fn orchestrate_switch(
@@ -1728,58 +2550,34 @@ impl AppRuntime {
             let _ = self.client.wake(&target_host.lan_ip, port, &token).await;
         }
 
-        // 3. Switch Deskflow keyboard/mouse focus to target slot when Deskflow guardian is enabled
-        static FOCUS_FOLLOWUP_SEQ: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
-        let focus_seq = FOCUS_FOLLOWUP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // 3. Switch Deskflow keyboard/mouse focus to target slot when Deskflow guardian is enabled.
+        // When `controller_host != local_id` AND `provider_host == controller_host`, bundle focus
+        // atomically inside `POST /v1/switch (sync_input_focus: true)` so the provider updates
+        // `observed_monitor_input` and `active_cursor_host` under one lock without a torn window.
+        let delegate_focus_to_controller =
+            controller_host.id != local_id && provider_host.id == controller_host.id;
+        CLIENT_REFOCUS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let reload_df = {
             let mut st = self.state.write().await;
             st.last_switch_activity_at = Instant::now();
             st.observed_monitor_input = Some(target_host.monitor_input);
             st.active_cursor_host = Some(target_host.id.clone());
+            let confine = st.should_confine_builtin_display();
+            st.applied_confined_builtin = confine;
+            kvmddc_platform::set_builtin_display_confined(confine);
+            sync_confine_builtin_flag(&self.data_dir, confine);
             st.should_reload_deskflow_links()
         };
         if reload_df {
             self.deskflow_reload_notify.notify_one();
         }
-        let df_on = self.state.read().await.cfg.deskflow_enabled;
-        if df_on {
-            if provider_host.id == local_id {
-                let slot = target_host.hotkey_slot;
-                let _ = tokio::task::spawn_blocking(move || {
-                    kvmddc_platform::trigger_internal_deskflow_slot(slot)
-                })
-                .await;
-                if target_host.id != local_id {
-                    tokio::spawn(async move {
-                        for delay_ms in [350_u64, 1500_u64] {
-                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                            if FOCUS_FOLLOWUP_SEQ.load(std::sync::atomic::Ordering::Relaxed)
-                                != focus_seq
-                            {
-                                break;
-                            }
-                            let _ = tokio::task::spawn_blocking(move || {
-                                kvmddc_platform::trigger_internal_deskflow_slot(slot)
-                            })
-                            .await;
-                        }
-                    });
-                }
-            } else {
-                let _ = self
-                    .client
-                    .focus_input(
-                        &provider_host.lan_ip,
-                        port,
-                        &token,
-                        &FocusInputRequest {
-                            target_host_id: target_host.id.clone(),
-                            hotkey_slot: target_host.hotkey_slot,
-                        },
-                    )
-                    .await;
-            }
+        if !delegate_focus_to_controller {
+            self.focus_deskflow_on_host(
+                &target_host.id,
+                target_host.hotkey_slot,
+                &[250, 800, 1800, 3000],
+            )
+            .await;
         }
 
         // 4. Enqueue DDC 0x60 switch on primary DDC controller (with local fallback)
@@ -1849,7 +2647,7 @@ impl AppRuntime {
                     from_host: Some(local_id),
                     to_host: target_host.id.clone(),
                     target_input: target_host.monitor_input,
-                    sync_input_focus: false,
+                    sync_input_focus: delegate_focus_to_controller,
                 },
             )
             .await;
@@ -2235,6 +3033,34 @@ impl AppRuntime {
             }
         };
 
+        let (reload_df, refocus_after_mode) = {
+            let mut st = self.state.write().await;
+            let mut refocus = None;
+            if let Some(th) = st
+                .cfg
+                .hosts
+                .iter()
+                .find(|h| h.enabled && h.id == target_id)
+                .cloned()
+            {
+                let on_shared_monitor = st.observed_monitor_input == Some(th.monitor_input);
+                let had_focus = st.active_cursor_host.as_deref() == Some(target_id.as_str());
+                if st.cfg.deskflow_enabled && (on_shared_monitor || had_focus) {
+                    st.active_cursor_host = Some(target_id.clone());
+                    st.last_switch_activity_at = Instant::now();
+                    refocus = Some((target_id.clone(), th.hotkey_slot));
+                }
+            }
+            (st.should_reload_deskflow_links(), refocus)
+        };
+        if reload_df {
+            self.deskflow_reload_notify.notify_one();
+        }
+        if let Some((fid, fslot)) = refocus_after_mode {
+            self.focus_deskflow_on_host(&fid, fslot, &[350, 1200, 2200])
+                .await;
+        }
+
         self.emit_hud("mode", hud_label, 100, false).await;
         self.dashboard_snapshot().await
     }
@@ -2256,6 +3082,7 @@ impl AppRuntime {
                 return self.dashboard_snapshot().await;
             }
             st.cfg.unify_cross_os_modifiers = !st.cfg.unify_cross_os_modifiers;
+            st.cfg.bump_shared_settings_rev();
             st.cfg.save(&self.data_dir)?;
         }
         self.deskflow_reload_notify.notify_one();
@@ -2267,6 +3094,7 @@ impl AppRuntime {
         {
             let mut st = self.state.write().await;
             st.cfg.deskflow_enabled = enabled;
+            st.cfg.bump_shared_settings_rev();
             if !enabled {
                 st.deskflow_running = false;
                 st.deskflow_connected = false;
@@ -2292,6 +3120,7 @@ impl AppRuntime {
                 return self.dashboard_snapshot().await;
             }
             st.cfg.ctrl_edge_switch_enabled = !st.cfg.ctrl_edge_switch_enabled;
+            st.cfg.bump_shared_settings_rev();
             st.cfg.save(&self.data_dir)?;
         }
         self.sync_peer_settings().await;
@@ -2414,6 +3243,49 @@ impl AppRuntime {
                     let _ = client.send_clipboard_png(&ip, port, &tok, payload).await;
                 });
             }
+        }
+    }
+
+    async fn run_hid_hotplug_loop(self: Arc<Self>) {
+        let mut tracker = InputHotplugTracker::new();
+        loop {
+            let (auto_switch, deskflow_enabled, local_id, current_provider) = {
+                let st = self.state.read().await;
+                (
+                    st.cfg.auto_switch_input_provider_on_hotplug,
+                    st.cfg.deskflow_enabled,
+                    st.cfg.local_host_id.clone(),
+                    st.cfg.input_provider_host_id.clone(),
+                )
+            };
+            let eligible = auto_switch && deskflow_enabled && current_provider != local_id;
+
+            let probe = tokio::task::spawn_blocking(|| {
+                let devices = list_external_input_devices();
+                let ax_trusted = kvmddc_platform::is_accessibility_trusted();
+                (devices, ax_trusted)
+            })
+            .await;
+
+            if let Ok((devices, ax_trusted)) = probe {
+                if let Some(claimed) =
+                    tracker.poll(Instant::now(), &devices, eligible, ax_trusted)
+                {
+                    let summary: Vec<String> = claimed
+                        .iter()
+                        .map(|d| format!("{} ({})", d.product, d.transport))
+                        .collect();
+                    eprintln!(
+                        "[kvmddc] hid hotplug claimed provider={local_id}: {}",
+                        summary.join(", ")
+                    );
+                    if let Err(err) = self.set_input_provider(local_id.clone()).await {
+                        eprintln!("[kvmddc] hid hotplug failed to set provider={local_id}: {err}");
+                    }
+                }
+            }
+
+            tokio::time::sleep(HID_HOTPLUG_POLL_INTERVAL).await;
         }
     }
 
@@ -2582,6 +3454,22 @@ impl AppRuntime {
                 h.enabled = true;
             }
             st.cfg.input_provider_host_id = host_id;
+            st.cfg.bump_shared_settings_rev();
+            if let Some(inp) = st.observed_monitor_input {
+                if let Some(mh) = st
+                    .cfg
+                    .hosts
+                    .iter()
+                    .find(|h| h.enabled && h.monitor_input == inp)
+                    .map(|h| h.id.clone())
+                {
+                    let online = mh == st.cfg.local_host_id
+                        || st.peer_online.get(&mh).copied().unwrap_or(false);
+                    if online {
+                        st.active_cursor_host = Some(mh);
+                    }
+                }
+            }
             st.cfg.save(&self.data_dir)?;
         }
         self.deskflow_reload_notify.notify_one();
@@ -2623,6 +3511,7 @@ impl AppRuntime {
                 return self.dashboard_snapshot().await;
             }
             st.cfg.allow_plain_slide_to_internal = !st.cfg.allow_plain_slide_to_internal;
+            st.cfg.bump_shared_settings_rev();
             st.cfg.save(&self.data_dir)?;
         }
         self.deskflow_reload_notify.notify_one();
@@ -2630,20 +3519,83 @@ impl AppRuntime {
         self.dashboard_snapshot().await
     }
 
+    async fn promote_resolved_peer_ip(&self, peer_id: &str, resolved_ip: &str) {
+        let changed = {
+            let mut st = self.state.write().await;
+            if let Some(h) = st.cfg.hosts.iter_mut().find(|h| h.id == peer_id) {
+                if h.lan_ip != resolved_ip {
+                    h.lan_ip = resolved_ip.to_string();
+                    let _ = st.cfg.save(&self.data_dir);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.deskflow_reload_notify.notify_one();
+        }
+    }
+
+    async fn fetch_peer_status_with_mdns(
+        &self,
+        peer: &HostNode,
+        port: u16,
+        token: &str,
+    ) -> Result<PeerStatusResponse> {
+        {
+            self.state
+                .write()
+                .await
+                .reconcile_disconnected_cursor_host(Duration::from_secs(5));
+        }
+        match self.client.status(&peer.lan_ip, port, token).await {
+            Ok(remote) => Ok(remote),
+            Err(first_err) => {
+                let candidates =
+                    resolve_peer_mdns_ips(peer.mdns_fallback.as_deref(), &peer.lan_ip, port).await;
+                for cand_ip in candidates {
+                    if let Ok(remote) = self.client.status(&cand_ip, port, token).await {
+                        if remote.host_id == peer.id {
+                            self.promote_resolved_peer_ip(&peer.id, &cand_ip).await;
+                            return Ok(remote);
+                        }
+                    }
+                }
+                Err(first_err)
+            }
+        }
+    }
+
+    async fn pair_peer_with_mdns(
+        &self,
+        peer: &HostNode,
+        port: u16,
+        token: &str,
+        req: &PairPeerRequest,
+    ) -> Result<PairPeerResponse> {
+        match self.client.pair(&peer.lan_ip, port, token, req).await {
+            Ok(resp) => Ok(resp),
+            Err(first_err) => {
+                let candidates =
+                    resolve_peer_mdns_ips(peer.mdns_fallback.as_deref(), &peer.lan_ip, port).await;
+                for cand_ip in candidates {
+                    if let Ok(resp) = self.client.pair(&cand_ip, port, token, req).await {
+                        if resp.host_id == peer.id {
+                            self.promote_resolved_peer_ip(&peer.id, &cand_ip).await;
+                            return Ok(resp);
+                        }
+                    }
+                }
+                Err(first_err)
+            }
+        }
+    }
+
     async fn sync_peer_settings(&self) {
-        let (
-            local_id,
-            local_ip,
-            port,
-            token,
-            peers,
-            my_fp,
-            provider_id,
-            df_on,
-            ctrl_edge_on,
-            allow_slide,
-            unify_mods,
-        ) = {
+        let (cfg_snapshot, local_ip, port, token, peers, my_fp) = {
             let st = self.state.read().await;
             let local_ip = st
                 .cfg
@@ -2658,39 +3610,19 @@ impl AppRuntime {
                 .cloned()
                 .collect();
             (
-                st.cfg.local_host_id.clone(),
+                st.cfg.clone(),
                 local_ip,
                 st.cfg.control_port,
                 st.cfg.shared_token.clone(),
                 peers,
                 self.identity.v2_fingerprint.clone(),
-                st.cfg.input_provider_host_id.clone(),
-                st.cfg.deskflow_enabled,
-                st.cfg.ctrl_edge_switch_enabled,
-                st.cfg.allow_plain_slide_to_internal,
-                st.cfg.unify_cross_os_modifiers,
             )
         };
 
+        let req = PairPeerRequest::from_config(&cfg_snapshot, local_ip, my_fp);
         for p in peers {
             if let Ok(resp) = self
-                .client
-                .pair(
-                    &p.lan_ip,
-                    port,
-                    &token,
-                    &PairPeerRequest {
-                        host_id: local_id.clone(),
-                        lan_ip: local_ip.clone(),
-                        tls_fingerprint: my_fp.clone(),
-                        mac_address: None,
-                        input_provider_host_id: Some(provider_id.clone()),
-                        deskflow_enabled: Some(df_on),
-                        ctrl_edge_switch_enabled: Some(ctrl_edge_on),
-                        allow_plain_slide_to_internal: Some(allow_slide),
-                        unify_cross_os_modifiers: Some(unify_mods),
-                    },
-                )
+                .pair_peer_with_mdns(&p, port, &token, &req)
                 .await
             {
                 let mut st = self.state.write().await;
@@ -2707,17 +3639,14 @@ impl AppRuntime {
     }
 
     pub async fn set_internal_alignment(&self, percent: u8) -> Result<DashboardStateDto> {
-        let clamped = percent.clamp(60, 100);
         {
             let mut st = self.state.write().await;
-            for h in &mut st.cfg.hosts {
-                if h.display_profile.has_internal_screen {
-                    h.display_profile.internal_height_percent = clamped;
-                }
-            }
+            st.cfg.set_internal_height_percent(percent);
+            st.cfg.bump_shared_settings_rev();
             st.cfg.save(&self.data_dir)?;
         }
         self.deskflow_reload_notify.notify_one();
+        self.sync_peer_settings().await;
         self.dashboard_snapshot().await
     }
 
@@ -2949,6 +3878,7 @@ impl AppRuntime {
             ctrl_edge_switch_enabled: st.cfg.ctrl_edge_switch_enabled,
             allow_plain_slide_to_internal: st.cfg.allow_plain_slide_to_internal,
             unify_cross_os_modifiers: st.cfg.unify_cross_os_modifiers,
+            auto_switch_input_provider_on_hotplug: st.cfg.auto_switch_input_provider_on_hotplug,
             observed_monitor_input: st.observed_monitor_input,
             preferred_brightness: st.cfg.preferred_brightness,
             current_brightness: st.current_brightness,
@@ -2964,7 +3894,7 @@ impl AppRuntime {
             display_sleeping: st.display_sleeping,
             external_display_online: st.external_display_online,
             monitor_model,
-            edge_locked: st.edge_locked || st.peer_edge_locked.values().copied().any(|v| v),
+            edge_locked: st.is_deskflow_session_locked(),
             clamshell_closed: st.clamshell_closed,
             plain_slide_active: st.effective_plain_slide_peer_id().is_some(),
             secure_input_active: st.secure_input_active,
@@ -2988,6 +3918,26 @@ struct TransferEntry {
     abs_path: PathBuf,
     rel_path: String,
     display_leaf: String,
+}
+
+fn spawn_deskflow_output_reader<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+    reader: R,
+    rt: Arc<AppRuntime>,
+    tap_flag: Arc<std::sync::atomic::AtomicBool>,
+    shape_flag: Arc<std::sync::atomic::AtomicBool>,
+) {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.contains("failed to create quartz event tap") {
+                tap_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            if line.contains("failed to initialize computer shape") {
+                shape_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            rt.ingest_deskflow_log(&line).await;
+        }
+    });
 }
 
 fn map_display_modes(list: Vec<DisplayModeOption>) -> Vec<DisplayModeDto> {
@@ -3245,6 +4195,17 @@ impl ControlPlaneHandler for AppRuntime {
                     .or(Some(st.cfg.preferred_color_preset)),
                 display_modes: st.local_display_modes.clone(),
                 clamshell_closed: st.clamshell_closed,
+                shared_settings_rev: st.cfg.shared_settings_rev,
+                input_provider_host_id: Some(st.cfg.input_provider_host_id.clone()),
+                primary_ddc_controller_id: Some(st.cfg.primary_ddc_controller_id.clone()),
+                deskflow_enabled: Some(st.cfg.deskflow_enabled),
+                ctrl_edge_switch_enabled: Some(st.cfg.ctrl_edge_switch_enabled),
+                allow_plain_slide_to_internal: Some(st.cfg.allow_plain_slide_to_internal),
+                unify_cross_os_modifiers: Some(st.cfg.unify_cross_os_modifiers),
+                auto_switch_input_provider_on_hotplug: Some(
+                    st.cfg.auto_switch_input_provider_on_hotplug,
+                ),
+                internal_height_percent: Some(st.cfg.internal_height_percent()),
             })
         })
     }
@@ -3280,13 +4241,18 @@ impl ControlPlaneHandler for AppRuntime {
                 )
             };
 
+            CLIENT_REFOCUS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let reload_df = {
                 let mut st = self.state.write().await;
                 st.last_switch_activity_at = Instant::now();
                 st.observed_monitor_input = Some(req.target_input);
-                if req.sync_input_focus {
+                if req.sync_input_focus || req.to_host == local_id {
                     st.active_cursor_host = Some(req.to_host.clone());
                 }
+                let confine = st.should_confine_builtin_display();
+                st.applied_confined_builtin = confine;
+                kvmddc_platform::set_builtin_display_confined(confine);
+                sync_confine_builtin_flag(&self.data_dir, confine);
                 st.should_reload_deskflow_links()
             };
             if reload_df {
@@ -3295,10 +4261,8 @@ impl ControlPlaneHandler for AppRuntime {
 
             if req.sync_input_focus && is_provider {
                 if let Some(slot) = slot_opt {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        kvmddc_platform::trigger_internal_deskflow_slot(slot)
-                    })
-                    .await;
+                    self.focus_deskflow_on_host(&req.to_host, slot, &[250, 800, 1800, 3000])
+                        .await;
                 }
             }
 
@@ -3377,15 +4341,27 @@ impl ControlPlaneHandler for AppRuntime {
 
     fn handle_focus_input(&self, req: FocusInputRequest) -> BoxFuture<'_, Result<ActionAck>> {
         Box::pin(async move {
-            let slot = req.hotkey_slot;
-            tokio::task::spawn_blocking(move || kvmddc_platform::trigger_internal_deskflow_slot(slot))
-                .await
-                .context("触发内部切屏按键线程失败")??;
+            CLIENT_REFOCUS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             {
                 let mut st = self.state.write().await;
                 st.last_switch_activity_at = Instant::now();
-                st.active_cursor_host = Some(req.target_host_id);
+                st.active_cursor_host = Some(req.target_host_id.clone());
+                if let Some(th_in) = st
+                    .cfg
+                    .hosts
+                    .iter()
+                    .find(|h| h.enabled && h.id == req.target_host_id)
+                    .filter(|h| {
+                        h.display_profile.has_internal_screen
+                            && st.is_host_clamshell_closed(&h.id)
+                    })
+                    .map(|h| h.monitor_input)
+                {
+                    st.observed_monitor_input = Some(th_in);
+                }
             }
+            self.focus_deskflow_on_host(&req.target_host_id, req.hotkey_slot, &[250, 900])
+                .await;
             Ok(ActionAck {
                 ok: true,
                 status: "focused".to_string(),
@@ -3481,14 +4457,17 @@ impl ControlPlaneHandler for AppRuntime {
     fn handle_pair(&self, req: PairPeerRequest) -> BoxFuture<'_, Result<PairPeerResponse>> {
         Box::pin(async move {
             validate_pure_lan_ip(&req.lan_ip)?;
-            let (local_id, was_dirty) = {
+            let incoming_shared = req.to_shared_settings();
+            let (local_id, reload_df, hide_picker, push_back) = {
                 let mut st = self.state.write().await;
                 st.peer_online.insert(req.host_id.clone(), true);
                 let mut dirty = false;
+                let mut ip_changed = false;
                 if let Some(h) = st.cfg.hosts.iter_mut().find(|h| h.id == req.host_id) {
                     if h.lan_ip != req.lan_ip {
                         h.lan_ip = req.lan_ip;
                         dirty = true;
+                        ip_changed = true;
                     }
                     if h.tls_fingerprint.as_deref() != Some(req.tls_fingerprint.as_str()) {
                         h.tls_fingerprint = Some(req.tls_fingerprint);
@@ -3499,54 +4478,31 @@ impl ControlPlaneHandler for AppRuntime {
                         dirty = true;
                     }
                 }
-                if let Some(new_provider) = req.input_provider_host_id {
-                    if st
-                        .cfg
-                        .hosts
-                        .iter()
-                        .any(|h| h.enabled && h.id == new_provider)
-                        && st.cfg.input_provider_host_id != new_provider
-                    {
-                        st.cfg.input_provider_host_id = new_provider;
-                        dirty = true;
-                    }
-                }
-                if let Some(df_on) = req.deskflow_enabled {
-                    if st.cfg.deskflow_enabled != df_on {
-                        st.cfg.deskflow_enabled = df_on;
-                        if !df_on {
-                            st.deskflow_running = false;
-                            st.deskflow_connected = false;
-                            st.active_cursor_host = Some(st.cfg.local_host_id.clone());
-                        }
-                        dirty = true;
-                    }
-                }
-                if let Some(ctrl_edge) = req.ctrl_edge_switch_enabled {
-                    if st.cfg.ctrl_edge_switch_enabled != ctrl_edge {
-                        st.cfg.ctrl_edge_switch_enabled = ctrl_edge;
-                        dirty = true;
-                    }
-                }
-                if let Some(allow_slide) = req.allow_plain_slide_to_internal {
-                    if st.cfg.allow_plain_slide_to_internal != allow_slide {
-                        st.cfg.allow_plain_slide_to_internal = allow_slide;
-                        dirty = true;
-                    }
-                }
-                if let Some(unify_mods) = req.unify_cross_os_modifiers {
-                    if st.cfg.unify_cross_os_modifiers != unify_mods {
-                        st.cfg.unify_cross_os_modifiers = unify_mods;
-                        dirty = true;
-                    }
+                let (sync_out, disabled_now) =
+                    st.apply_shared_reconcile(&incoming_shared, &req.host_id);
+                if sync_out.changed {
+                    dirty = true;
                 }
                 if dirty {
                     st.cfg.save(&self.data_dir)?;
                 }
-                (st.cfg.local_host_id.clone(), dirty)
+                (
+                    st.cfg.local_host_id.clone(),
+                    ip_changed
+                        || sync_out.deskflow_reload_needed
+                        || st.should_reload_deskflow_links(),
+                    disabled_now,
+                    sync_out.push_back_to_source,
+                )
             };
-            if was_dirty {
+            if hide_picker {
+                self.hide_edge_picker().await;
+            }
+            if reload_df {
                 self.deskflow_reload_notify.notify_one();
+            }
+            if push_back {
+                self.sync_peer_settings().await;
             }
             Ok(PairPeerResponse {
                 host_id: local_id,
@@ -3629,9 +4585,578 @@ impl ControlPlaneHandler for AppRuntime {
     }
 }
 
+impl LiveState {
+    /// Clears stale `active_cursor_host` pointing to a disconnected/offline peer on the active
+    /// input provider after a switch grace window so Deskflow and UI focus never strand.
+    fn reconcile_disconnected_cursor_host(&mut self, grace: Duration) {
+        if !self.cfg.is_input_provider() || self.last_switch_activity_at.elapsed() < grace {
+            return;
+        }
+        let Some(cur) = self.active_cursor_host.as_deref() else {
+            return;
+        };
+        if cur == self.cfg.local_host_id {
+            return;
+        }
+        let peer_online = self.peer_online.get(cur).copied().unwrap_or(false);
+        let peer_locked = self.peer_edge_locked.get(cur).copied().unwrap_or(false);
+        let deskflow_link_up = !self.cfg.deskflow_enabled || self.deskflow_connected;
+        if !peer_online || peer_locked || !deskflow_link_up {
+            self.active_cursor_host = Some(self.cfg.local_host_id.clone());
+        }
+    }
+
+    /// Returns `(host_id, hotkey_slot)` of the remote host currently displayed on the 27" monitor
+    /// when a Deskflow reset back to `local_host_id` is involuntary (caused by a peer resolution /
+    /// DP-wake shape change, or occurring while `active_cursor_host` was on a remote peer and no
+    /// plain slide link exists during a switch window).
+    ///
+    /// Crucial invariant: if `self.active_cursor_host` is ALREADY `local_host_id`, switching to
+    /// `local_host_id` was intentional and MUST NEVER bounce back to a peer!
+    fn involuntary_local_reset_escape_target(&self) -> Option<(String, u8)> {
+        if !self.cfg.is_input_provider()
+            || self.active_cursor_host.as_deref() == Some(self.cfg.local_host_id.as_str())
+        {
+            return None;
+        }
+        let inp = self.observed_monitor_input?;
+        let mh = self
+            .cfg
+            .hosts
+            .iter()
+            .find(|h| h.enabled && h.monitor_input == inp && h.id != self.cfg.local_host_id)?;
+        let online = self.peer_online.get(&mh.id).copied().unwrap_or(false);
+        let locked = self.peer_edge_locked.get(&mh.id).copied().unwrap_or(false);
+        if !online || locked {
+            return None;
+        }
+        let shape_changed_recently = LAST_PEER_SHAPE_CHANGE
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .is_some_and(|(hid, at)| hid == mh.id && at.elapsed() < Duration::from_millis(2200));
+        let no_plain_slide_during_switch = self.effective_plain_slide_peer_id().is_none()
+            && self.last_switch_activity_at.elapsed() < Duration::from_millis(4000);
+        if shape_changed_recently || no_plain_slide_during_switch {
+            Some((mh.id.clone(), mh.hotkey_slot))
+        } else {
+            None
+        }
+    }
+
+    /// Update Deskflow connection/focus state from one parsed log event and optionally return
+    /// `(host_id, hotkey_slot)` to refocus an already-visible remote screen after reconnect.
+    pub(crate) fn apply_deskflow_log_event(
+        &mut self,
+        ev: DeskflowLogEvent,
+    ) -> Option<(String, u8)> {
+        match ev {
+            DeskflowLogEvent::PeerShapeChanged { host_id } => {
+                if self.cfg.is_input_provider() {
+                    if let Ok(mut guard) = LAST_PEER_SHAPE_CHANGE.lock() {
+                        *guard = Some((host_id.clone(), Instant::now()));
+                    }
+                    if let Some(h) = self
+                        .cfg
+                        .hosts
+                        .iter()
+                        .find(|h| h.enabled && h.id == host_id && h.id != self.cfg.local_host_id)
+                        .cloned()
+                    {
+                        if self.observed_monitor_input == Some(h.monitor_input) {
+                            self.active_cursor_host = Some(host_id.clone());
+                            self.last_switch_activity_at = Instant::now();
+                            return Some((host_id, h.hotkey_slot));
+                        }
+                    }
+                }
+                None
+            }
+            DeskflowLogEvent::Switched { to, .. } => {
+                self.deskflow_screen_host = Some(to.clone());
+                if to == self.cfg.local_host_id {
+                    if let Some((esc_id, esc_slot)) = self.involuntary_local_reset_escape_target() {
+                        self.active_cursor_host = Some(esc_id.clone());
+                        return Some((esc_id, esc_slot));
+                    }
+                }
+                let matched_followup = FOCUS_FOLLOWUP_TARGET
+                    .lock()
+                    .ok()
+                    .is_some_and(|mut g| {
+                        if g.as_deref() == Some(to.as_str()) {
+                            *g = None;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                if matched_followup || self.active_cursor_host.as_deref() != Some(to.as_str()) {
+                    FOCUS_FOLLOWUP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.active_cursor_host = Some(to);
+                None
+            }
+            DeskflowLogEvent::ClientConnected => self.on_deskflow_client_connected(None),
+            DeskflowLogEvent::PeerClientConnected { host_id } => {
+                self.on_deskflow_client_connected(Some(host_id))
+            }
+            DeskflowLogEvent::PeerClientDisconnected { host_id } => {
+                if self.deskflow_screen_host.as_deref() == Some(host_id.as_str()) {
+                    self.deskflow_screen_host = Some(self.cfg.local_host_id.clone());
+                }
+                if self.cfg.is_input_provider() {
+                    if !self.has_other_online_peer(&host_id) {
+                        self.deskflow_connected = false;
+                    }
+                    if self.active_cursor_host.as_deref() == Some(host_id.as_str()) {
+                        return self.recover_cursor_after_invisible_or_lost_target(&host_id);
+                    }
+                } else {
+                    self.deskflow_connected = false;
+                }
+                None
+            }
+            DeskflowLogEvent::ClientDisconnected => {
+                if !self.cfg.is_input_provider() {
+                    self.deskflow_connected = false;
+                } else if !self.has_other_online_peer("") {
+                    self.deskflow_connected = false;
+                    self.deskflow_screen_host = Some(self.cfg.local_host_id.clone());
+                    if self.active_cursor_host.as_deref() != Some(self.cfg.local_host_id.as_str())
+                    {
+                        self.active_cursor_host = Some(self.cfg.local_host_id.clone());
+                    }
+                }
+                None
+            }
+            DeskflowLogEvent::EnteringScreen => {
+                let local_id = self.cfg.local_host_id.clone();
+                self.deskflow_screen_host = Some(local_id.clone());
+                if let Some((esc_id, esc_slot)) = self.involuntary_local_reset_escape_target() {
+                    self.active_cursor_host = Some(esc_id.clone());
+                    return Some((esc_id, esc_slot));
+                }
+                let matched_followup = FOCUS_FOLLOWUP_TARGET
+                    .lock()
+                    .ok()
+                    .is_some_and(|mut g| {
+                        if g.as_deref() == Some(local_id.as_str()) {
+                            *g = None;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                if matched_followup || self.active_cursor_host.as_deref() != Some(local_id.as_str())
+                {
+                    FOCUS_FOLLOWUP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.active_cursor_host = Some(local_id);
+                None
+            }
+            DeskflowLogEvent::LeavingScreen => None,
+        }
+    }
+
+    fn has_other_online_peer(&self, excluded_host_id: &str) -> bool {
+        self.cfg.hosts.iter().any(|h| {
+            h.enabled
+                && h.id != self.cfg.local_host_id
+                && h.id != excluded_host_id
+                && self.peer_online.get(&h.id).copied().unwrap_or(false)
+        })
+    }
+
+    fn recover_cursor_after_invisible_or_lost_target(
+        &mut self,
+        blocked_target_id: &str,
+    ) -> Option<(String, u8)> {
+        let local_id = self.cfg.local_host_id.clone();
+        let local_input = self.cfg.local_host().ok().map(|lh| lh.monitor_input);
+        let local_closed_invisible = self
+            .cfg
+            .local_host()
+            .ok()
+            .map(|lh| {
+                lh.display_profile.has_internal_screen
+                    && self.clamshell_closed
+                    && self.observed_monitor_input != Some(lh.monitor_input)
+            })
+            .unwrap_or(false);
+
+        if !local_closed_invisible && self.observed_monitor_input == local_input {
+            self.active_cursor_host = Some(local_id);
+            return None;
+        }
+        let candidates = [
+            Some(blocked_target_id),
+            local_closed_invisible.then_some(local_id.as_str()),
+        ];
+        for candidate in candidates.into_iter().flatten() {
+            if let Some((esc_id, esc_slot)) = self.monitor_escape_target_for_closed_laptop(candidate) {
+                if esc_id != blocked_target_id {
+                    self.active_cursor_host = Some(esc_id.clone());
+                    return (esc_id != local_id).then_some((esc_id, esc_slot));
+                }
+            }
+        }
+        self.active_cursor_host = Some(local_id);
+        None
+    }
+
+    fn on_deskflow_client_connected(
+        &mut self,
+        connected_peer: Option<String>,
+    ) -> Option<(String, u8)> {
+        self.deskflow_connected = true;
+        if !self.cfg.is_input_provider() {
+            return None;
+        }
+        if let Some(ref peer_id) = connected_peer {
+            if let Some(h) = self
+                .cfg
+                .hosts
+                .iter()
+                .find(|h| h.enabled && h.id == *peer_id && h.id != self.cfg.local_host_id)
+                .cloned()
+            {
+                if self.observed_monitor_input == Some(h.monitor_input) {
+                    self.active_cursor_host = Some(peer_id.clone());
+                    self.last_switch_activity_at = Instant::now();
+                    return Some((peer_id.clone(), h.hotkey_slot));
+                }
+            }
+        }
+        let tid = self.active_cursor_host.clone()?;
+        if tid == self.cfg.local_host_id {
+            return None;
+        }
+        if let Some(ref peer_id) = connected_peer {
+            if peer_id != &tid {
+                return None;
+            }
+        }
+        let h = self
+            .cfg
+            .hosts
+            .iter()
+            .find(|h| h.enabled && h.id == tid)
+            .cloned()?;
+
+        let target_on_shared_monitor = self.observed_monitor_input == Some(h.monitor_input);
+        let plain_slide_to_target = h.display_profile.has_internal_screen
+            && !self.is_host_clamshell_closed(&tid)
+            && self.effective_plain_slide_peer_id().as_deref() == Some(tid.as_str());
+
+        if target_on_shared_monitor || plain_slide_to_target {
+            return Some((tid, h.hotkey_slot));
+        }
+
+        let invisible_clamshell = h.display_profile.has_internal_screen
+            && self.is_host_clamshell_closed(&tid)
+            && self.observed_monitor_input != Some(h.monitor_input);
+        if self.observed_monitor_input.is_some() || invisible_clamshell {
+            return self.recover_cursor_after_invisible_or_lost_target(&tid);
+        }
+
+        Some((tid, h.hotkey_slot))
+    }
+}
+
+const HID_HOTPLUG_POLL_INTERVAL: Duration = Duration::from_millis(450);
+const HID_DISCOVERY_SETTLE: Duration = Duration::from_millis(700);
+const HID_SELF_BOUNCE_GRACE: Duration = Duration::from_millis(2500);
+
+/// Pure state machine tracking external USB/Bluetooth mouse & keyboard hotplug transitions.
+///
+/// First poll captures standing peripherals so existing host devices (such as a secondary Windows
+/// mouse left plugged in) never trigger spurious provider handoffs. Newly arrived devices must
+/// remain present across `HID_DISCOVERY_SETTLE` so multi-port hubs claim once together.
+#[derive(Debug, Default)]
+struct InputHotplugTracker {
+    initialized: bool,
+    known_keys: HashSet<String>,
+    recent_removals: HashMap<String, Instant>,
+    pending_arrivals: HashMap<String, Instant>,
+    pending_untrusted_keys: HashSet<String>,
+}
+
+impl InputHotplugTracker {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Evaluates the latest external input device snapshot and returns newly settled devices when
+    /// this host should claim `input_provider_host_id`.
+    fn poll(
+        &mut self,
+        now: Instant,
+        devices: &[ExternalInputDevice],
+        eligible_to_claim: bool,
+        ax_trusted: bool,
+    ) -> Option<Vec<ExternalInputDevice>> {
+        let mut current_map: HashMap<&str, &ExternalInputDevice> = HashMap::new();
+        for d in devices {
+            current_map.entry(d.device_key.as_str()).or_insert(d);
+        }
+
+        self.recent_removals.retain(|_, removed_at| {
+            now.saturating_duration_since(*removed_at) < HID_SELF_BOUNCE_GRACE
+        });
+
+        if !self.initialized {
+            self.initialized = true;
+            self.known_keys = current_map.keys().map(|k| (*k).to_string()).collect();
+            return None;
+        }
+
+        let removed: Vec<String> = self
+            .known_keys
+            .iter()
+            .filter(|k| !current_map.contains_key(k.as_str()))
+            .cloned()
+            .collect();
+        for k in removed {
+            self.known_keys.remove(&k);
+            self.recent_removals.insert(k, now);
+        }
+
+        self.pending_arrivals
+            .retain(|k, _| current_map.contains_key(k.as_str()));
+        self.pending_untrusted_keys
+            .retain(|k| current_map.contains_key(k.as_str()));
+
+        for key in current_map.keys() {
+            if self.known_keys.contains(*key) {
+                continue;
+            }
+            // Brief unplug/replug bounce on the same host should not steal Deskflow back.
+            if self.recent_removals.remove(*key).is_some() {
+                self.known_keys.insert((*key).to_string());
+                continue;
+            }
+            self.pending_arrivals
+                .entry((*key).to_string())
+                .or_insert(now);
+        }
+
+        if !eligible_to_claim {
+            for k in self.pending_arrivals.keys() {
+                self.known_keys.insert(k.clone());
+            }
+            self.pending_arrivals.clear();
+            self.pending_untrusted_keys.clear();
+            return None;
+        }
+
+        let settled = self
+            .pending_arrivals
+            .values()
+            .any(|since| now.saturating_duration_since(*since) >= HID_DISCOVERY_SETTLE);
+        if settled {
+            let claimed: Vec<ExternalInputDevice> = devices
+                .iter()
+                .filter(|d| self.pending_arrivals.contains_key(&d.device_key))
+                .cloned()
+                .collect();
+            for k in self.pending_arrivals.keys() {
+                self.known_keys.insert(k.clone());
+            }
+            self.pending_arrivals.clear();
+            if ax_trusted {
+                self.pending_untrusted_keys.clear();
+                if !claimed.is_empty() {
+                    return Some(claimed);
+                }
+            } else {
+                // Hold claim until macOS Accessibility TCC is granted so the cluster never switches
+                // to a host that cannot run Deskflow Server.
+                for d in claimed {
+                    self.pending_untrusted_keys.insert(d.device_key);
+                }
+            }
+            return None;
+        }
+
+        if ax_trusted && !self.pending_untrusted_keys.is_empty() {
+            let deferred: Vec<ExternalInputDevice> = devices
+                .iter()
+                .filter(|d| self.pending_untrusted_keys.contains(&d.device_key))
+                .cloned()
+                .collect();
+            self.pending_untrusted_keys.clear();
+            if !deferred.is_empty() {
+                return Some(deferred);
+            }
+        }
+
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preferred_local_ip_preserves_active_configured_nic_and_mdns_filters_pure_lan() {
+        let active = vec![
+            "192.168.2.207".to_string(),
+            "192.168.2.36".to_string(),
+            "100.64.0.42".to_string(),
+        ];
+        // On macOS (prefer_primary_nic = true), primary en0 (.207) beats transient USB-C hub NIC (.36)
+        assert_eq!(
+            select_preferred_local_pure_lan_ip(
+                Some("192.168.2.36"),
+                &active,
+                Some("192.168.2.36"),
+                true,
+            )
+            .as_deref(),
+            Some("192.168.2.207")
+        );
+        // On Windows (prefer_primary_nic = false), active configured NIC (.36) is preserved
+        assert_eq!(
+            select_preferred_local_pure_lan_ip(
+                Some("192.168.2.36"),
+                &active,
+                Some("192.168.2.207"),
+                false,
+            )
+            .as_deref(),
+            Some("192.168.2.36")
+        );
+        // When configured IP is no longer up on any interface, fall back to routed LAN IP
+        assert_eq!(
+            select_preferred_local_pure_lan_ip(
+                Some("192.168.2.99"),
+                &active,
+                Some("192.168.2.207"),
+                false,
+            )
+            .as_deref(),
+            Some("192.168.2.207")
+        );
+
+        let addrs: Vec<std::net::SocketAddr> = vec![
+            "100.64.0.42:49730".parse().unwrap(),
+            "192.168.2.101:49730".parse().unwrap(),
+            "192.168.2.16:49730".parse().unwrap(),
+            "192.168.2.16:49730".parse().unwrap(),
+            "127.0.0.1:49730".parse().unwrap(),
+        ];
+        assert_eq!(
+            filter_pure_lan_candidate_ips(addrs, "192.168.2.101"),
+            vec!["192.168.2.16".to_string()]
+        );
+    }
+
+    #[test]
+    fn edge_candidate_sorter_prioritizes_online_and_non_monitor_owner() {
+        let mut candidates = vec![
+            EdgeCandidateDto {
+                id: "mac-studio".into(),
+                display_name: "Mac Studio".into(),
+                monitor_input: 17,
+                hotkey_slot: 3,
+                online: false,
+            },
+            EdgeCandidateDto {
+                id: "win-desktop".into(),
+                display_name: "Windows".into(),
+                monitor_input: 15,
+                hotkey_slot: 2,
+                online: true,
+            },
+            EdgeCandidateDto {
+                id: "macbook".into(),
+                display_name: "MacBook".into(),
+                monitor_input: 21,
+                hotkey_slot: 1,
+                online: true,
+            },
+        ];
+        sort_edge_candidates_for_picker(&mut candidates, Some(21));
+        assert_eq!(candidates[0].id, "win-desktop");
+        assert_eq!(candidates[1].id, "macbook");
+        assert_eq!(candidates[2].id, "mac-studio");
+    }
+
+    #[test]
+    fn disconnected_cursor_host_recovers_to_provider_after_grace() {
+        let mut cfg = AppConfig::default_home_setup("macbook", "test-token".to_string());
+        cfg.input_provider_host_id = "macbook".to_string();
+        let mut peer_online = HashMap::new();
+        peer_online.insert("macbook".to_string(), true);
+        peer_online.insert("win-desktop".to_string(), true);
+        peer_online.insert("mac-studio".to_string(), false);
+        let mut peer_edge_locked = HashMap::new();
+        peer_edge_locked.insert("mac-studio".to_string(), true);
+
+        let mut st = LiveState {
+            cfg,
+            deskflow_running: true,
+            deskflow_connected: true,
+            accessibility_trusted: true,
+            display_sleeping: false,
+            saved_ddc_brightness_before_sleep: None,
+            external_display_online: true,
+            local_probe: ConnectedMonitorProbe::default(),
+            local_display_modes: Vec::new(),
+            peer_detected_inputs: HashMap::new(),
+            peer_detected_ports: HashMap::new(),
+            peer_detected_modes: HashMap::new(),
+            peer_display_modes: HashMap::new(),
+            peer_monitor_model: None,
+            active_cursor_host: Some("mac-studio".to_string()),
+            deskflow_screen_host: Some("mac-studio".to_string()),
+            observed_monitor_input: Some(21),
+            current_brightness: Some(75),
+            current_volume: Some(50),
+            current_color_preset: Some(5),
+            last_clipboard_png_sha: None,
+            last_transfer_summary: None,
+            edge_locked: false,
+            peer_edge_locked,
+            clamshell_closed: true,
+            peer_clamshell_closed: HashMap::new(),
+            applied_slide_peer_id: None,
+            applied_mouse_adjustment: None,
+            applied_confined_builtin: false,
+            last_switch_activity_at: Instant::now() - Duration::from_secs(10),
+            secure_input_active: false,
+            last_error: None,
+            peer_online,
+            picker_visible: false,
+            picker_bounds: None,
+            edge_candidates: Vec::new(),
+            hovered_candidate_id: None,
+        };
+
+        // Offline/untrusted target heals back to local input provider
+        st.reconcile_disconnected_cursor_host(Duration::from_secs(5));
+        assert_eq!(st.active_cursor_host.as_deref(), Some("macbook"));
+
+        // Connected online target (win-desktop) remains focused
+        st.active_cursor_host = Some("win-desktop".to_string());
+        st.reconcile_disconnected_cursor_host(Duration::from_secs(5));
+        assert_eq!(st.active_cursor_host.as_deref(), Some("win-desktop"));
+
+        // Idle locked third peer (mac-studio) must never lock Deskflow or plain-slide between macbook & win-desktop
+        assert!(!st.is_deskflow_session_locked());
+        st.clamshell_closed = false;
+        let win_input = st
+            .cfg
+            .hosts
+            .iter()
+            .find(|h| h.id == "win-desktop")
+            .unwrap()
+            .monitor_input;
+        st.observed_monitor_input = Some(win_input);
+        assert_eq!(st.effective_plain_slide_peer_id().as_deref(), Some("win-desktop"));
+    }
 
     #[test]
     fn non_overwriting_path_reuses_identical_sha_and_suffixes_different_bytes() {
@@ -3700,6 +5225,7 @@ mod tests {
             peer_display_modes: HashMap::new(),
             peer_monitor_model: None,
             active_cursor_host: Some("macbook".to_string()),
+            deskflow_screen_host: Some("macbook".to_string()),
             observed_monitor_input: Some(21), // 27" monitor on macbook
             current_brightness: Some(80),
             current_volume: Some(75),
@@ -3712,11 +5238,13 @@ mod tests {
             peer_clamshell_closed: HashMap::new(),
             applied_slide_peer_id: None,
             applied_mouse_adjustment: None,
+            applied_confined_builtin: false,
             last_switch_activity_at: Instant::now() - Duration::from_secs(10),
             secure_input_active: false,
             last_error: None,
             peer_online,
             picker_visible: false,
+            picker_bounds: None,
             edge_candidates: Vec::new(),
             hovered_candidate_id: None,
         };
@@ -3766,7 +5294,7 @@ mod tests {
         // 3. Client node (not input provider) -> None
         assert_eq!(compute_deskflow_mouse_adjustment(&mac_srv_as_client(), Some(21)), None);
 
-        // 4. MacBook (2560) providing input only to Mac Studio (2560) -> None (1:1)
+        // 4. MacBook (2560) providing input only to Mac Studio (2560 or 1920 HiDPI) -> None (1:1)
         let mut two_macs = AppConfig::default_home_setup("macbook", "t".repeat(48));
         two_macs.input_provider_host_id = "macbook".to_string();
         for h in &mut two_macs.hosts {
@@ -3778,11 +5306,597 @@ mod tests {
             }
         }
         assert_eq!(compute_deskflow_mouse_adjustment(&two_macs, Some(15)), None);
+        for h in &mut two_macs.hosts {
+            if h.id == "mac-studio" {
+                h.display_profile.preferred_width = 1920;
+                h.display_profile.preferred_height = 1080;
+            }
+        }
+        assert_eq!(compute_deskflow_mouse_adjustment(&two_macs, Some(15)), None);
+    }
+
+    #[test]
+    fn mouse_adjustment_3host_prefers_same_platform_unless_windows_active() {
+        let mut tri = AppConfig::default_home_setup("macbook", "t".repeat(48));
+        for h in &mut tri.hosts {
+            h.enabled = true;
+            if h.id == "win-desktop" {
+                h.monitor_input = 15;
+            } else if h.id == "mac-studio" {
+                h.monitor_input = 17;
+            } else if h.id == "macbook" {
+                h.monitor_input = 21;
+            }
+        }
+
+        // MacBook server (2560): only scale to 2.00 when Windows (15) is on the 27" monitor.
+        tri.local_host_id = "macbook".to_string();
+        tri.input_provider_host_id = "macbook".to_string();
+        assert_eq!(compute_deskflow_mouse_adjustment(&tri, Some(21)), None);
+        assert_eq!(compute_deskflow_mouse_adjustment(&tri, Some(17)), None);
+        assert_eq!(
+            compute_deskflow_mouse_adjustment(&tri, Some(15)).as_deref(),
+            Some("2.00")
+        );
+        assert_eq!(compute_deskflow_mouse_adjustment(&tri, None), None);
+
+        // Mac Studio server (2560): 1:1 with MacBook (21) or itself (17), 2.00 when Windows (15) active.
+        tri.local_host_id = "mac-studio".to_string();
+        tri.input_provider_host_id = "mac-studio".to_string();
+        assert_eq!(compute_deskflow_mouse_adjustment(&tri, Some(17)), None);
+        assert_eq!(compute_deskflow_mouse_adjustment(&tri, Some(21)), None);
+        assert_eq!(
+            compute_deskflow_mouse_adjustment(&tri, Some(15)).as_deref(),
+            Some("2.00")
+        );
+
+        // Windows server (5120): always scales down 0.50 toward 2560 Mac clients.
+        tri.local_host_id = "win-desktop".to_string();
+        tri.input_provider_host_id = "win-desktop".to_string();
+        assert_eq!(
+            compute_deskflow_mouse_adjustment(&tri, Some(21)).as_deref(),
+            Some("0.50")
+        );
+        assert_eq!(
+            compute_deskflow_mouse_adjustment(&tri, Some(15)).as_deref(),
+            Some("0.50")
+        );
     }
 
     fn mac_srv_as_client() -> AppConfig {
         let mut c = AppConfig::default_home_setup("macbook", "t".repeat(48));
         c.input_provider_host_id = "win-desktop".to_string();
         c
+    }
+
+    #[test]
+    fn clamshell_escape_target_and_client_reconnect_cursor_guard() {
+        let mut cfg = AppConfig::default_home_setup("macbook", "tok123".to_string());
+        cfg.input_provider_host_id = "macbook".to_string();
+        for h in &mut cfg.hosts {
+            h.enabled = true;
+        }
+        let mut peer_online = HashMap::new();
+        peer_online.insert("macbook".to_string(), true);
+        peer_online.insert("mac-studio".to_string(), true);
+        peer_online.insert("win-desktop".to_string(), true);
+
+        let mut st = LiveState {
+            cfg,
+            deskflow_running: true,
+            deskflow_connected: true,
+            accessibility_trusted: true,
+            display_sleeping: false,
+            saved_ddc_brightness_before_sleep: None,
+            external_display_online: true, // stays true over USB-C even if monitor input is on Studio
+            local_probe: ConnectedMonitorProbe::default(),
+            local_display_modes: Vec::new(),
+            peer_detected_inputs: HashMap::new(),
+            peer_detected_ports: HashMap::new(),
+            peer_detected_modes: HashMap::new(),
+            peer_display_modes: HashMap::new(),
+            peer_monitor_model: None,
+            active_cursor_host: Some("mac-studio".to_string()),
+            deskflow_screen_host: Some("mac-studio".to_string()),
+            observed_monitor_input: Some(15), // mac-studio default port 15
+            current_brightness: Some(80),
+            current_volume: Some(75),
+            current_color_preset: Some(5),
+            last_clipboard_png_sha: None,
+            last_transfer_summary: None,
+            edge_locked: false,
+            peer_edge_locked: HashMap::new(),
+            clamshell_closed: true,
+            peer_clamshell_closed: HashMap::new(),
+            applied_slide_peer_id: None,
+            applied_mouse_adjustment: None,
+            applied_confined_builtin: false,
+            last_switch_activity_at: Instant::now() - Duration::from_secs(10),
+            secure_input_active: false,
+            last_error: None,
+            peer_online,
+            picker_visible: false,
+            picker_bounds: None,
+            edge_candidates: Vec::new(),
+            hovered_candidate_id: None,
+        };
+
+        // Closed MacBook while 27" monitor shows mac-studio escapes cursor to mac-studio.
+        assert_eq!(
+            st.monitor_escape_target_for_closed_laptop("macbook"),
+            Some(("mac-studio".to_string(), 3))
+        );
+
+        // Client during transient Deskflow disconnect keeps remote focus while provider is online.
+        st.cfg.local_host_id = "win-desktop".to_string();
+        st.deskflow_connected = false;
+        assert!(!st.has_local_cursor_for_controls());
+
+        // If cursor really is on win-desktop, or provider went offline, local controls activate.
+        st.active_cursor_host = Some("win-desktop".to_string());
+        assert!(st.has_local_cursor_for_controls());
+        st.active_cursor_host = Some("mac-studio".to_string());
+        st.peer_online.insert("macbook".to_string(), false);
+        assert!(st.has_local_cursor_for_controls());
+    }
+
+    #[test]
+    fn peer_connect_and_disconnect_never_hijack_visible_local_cursor() {
+        let mut cfg = AppConfig::default_home_setup("macbook", "tok123".to_string());
+        cfg.input_provider_host_id = "macbook".to_string();
+        cfg.allow_plain_slide_to_internal = false;
+        for h in &mut cfg.hosts {
+            h.enabled = true;
+        }
+        let mut peer_online = HashMap::new();
+        peer_online.insert("macbook".to_string(), true);
+        peer_online.insert("mac-studio".to_string(), true);
+        peer_online.insert("win-desktop".to_string(), true);
+
+        let mut st = LiveState {
+            cfg,
+            deskflow_running: true,
+            deskflow_connected: true,
+            accessibility_trusted: true,
+            display_sleeping: false,
+            saved_ddc_brightness_before_sleep: None,
+            external_display_online: true,
+            local_probe: ConnectedMonitorProbe::default(),
+            local_display_modes: Vec::new(),
+            peer_detected_inputs: HashMap::new(),
+            peer_detected_ports: HashMap::new(),
+            peer_detected_modes: HashMap::new(),
+            peer_display_modes: HashMap::new(),
+            peer_monitor_model: None,
+            active_cursor_host: Some("mac-studio".to_string()),
+            deskflow_screen_host: Some("mac-studio".to_string()),
+            observed_monitor_input: Some(21), // 27" monitor is on MacBook (USB-C)
+            current_brightness: Some(80),
+            current_volume: Some(75),
+            current_color_preset: Some(5),
+            last_clipboard_png_sha: None,
+            last_transfer_summary: None,
+            edge_locked: false,
+            peer_edge_locked: HashMap::new(),
+            clamshell_closed: true,
+            peer_clamshell_closed: HashMap::new(),
+            applied_slide_peer_id: None,
+            applied_mouse_adjustment: None,
+            applied_confined_builtin: false,
+            last_switch_activity_at: Instant::now() - Duration::from_secs(10),
+            secure_input_active: false,
+            last_error: None,
+            peer_online,
+            picker_visible: false,
+            picker_bounds: None,
+            edge_candidates: Vec::new(),
+            hovered_candidate_id: None,
+        };
+
+        // 1. Stale active_cursor_host="mac-studio" while 27" monitor shows MacBook (21):
+        // Mac Studio connecting must NOT emit F20 to steal focus off MacBook, and resets to macbook.
+        let refocus = st.apply_deskflow_log_event(DeskflowLogEvent::PeerClientConnected {
+            host_id: "mac-studio".to_string(),
+        });
+        assert_eq!(refocus, None);
+        assert_eq!(st.active_cursor_host.as_deref(), Some("macbook"));
+
+        // 2. If active_cursor_host="mac-studio" and Mac Studio disconnects, focus resets cleanly
+        // to local macbook while keeping deskflow_connected=true (win-desktop is still online).
+        st.active_cursor_host = Some("mac-studio".to_string());
+        let after_dc = st.apply_deskflow_log_event(DeskflowLogEvent::PeerClientDisconnected {
+            host_id: "mac-studio".to_string(),
+        });
+        assert_eq!(after_dc, None);
+        assert_eq!(st.active_cursor_host.as_deref(), Some("macbook"));
+        assert!(st.deskflow_connected);
+
+        // 3. When 27" monitor actually displays win-desktop (17), win-desktop reconnecting DOES refocus.
+        st.observed_monitor_input = Some(17);
+        st.active_cursor_host = Some("win-desktop".to_string());
+        let unrelated = st.apply_deskflow_log_event(DeskflowLogEvent::PeerClientConnected {
+            host_id: "mac-studio".to_string(),
+        });
+        assert_eq!(unrelated, None);
+        let win_refocus = st.apply_deskflow_log_event(DeskflowLogEvent::PeerClientConnected {
+            host_id: "win-desktop".to_string(),
+        });
+        assert!(matches!(win_refocus, Some((ref h, _)) if h == "win-desktop"));
+    }
+
+    fn mk_ext_device(
+        key: &str,
+        kind: kvmddc_platform::ExternalInputKind,
+        product: &str,
+    ) -> ExternalInputDevice {
+        ExternalInputDevice {
+            device_key: key.to_string(),
+            kind,
+            product: product.to_string(),
+            transport: "USB".to_string(),
+        }
+    }
+
+    #[test]
+    fn input_hotplug_tracker_ignores_baseline_and_standing_windows_devices() {
+        let mut tracker = InputHotplugTracker::new();
+        let t0 = Instant::now();
+        let razer = mk_ext_device(
+            "win:mouse:hid#vid_1532&pid_006e",
+            kvmddc_platform::ExternalInputKind::Mouse,
+            "VID_1532 PID_006E",
+        );
+        let rx_24g = mk_ext_device(
+            "win:keyboard:hid#vid_3554&pid_fa09",
+            kvmddc_platform::ExternalInputKind::Keyboard,
+            "VID_3554 PID_FA09",
+        );
+
+        assert_eq!(
+            tracker.poll(t0, &[razer.clone(), rx_24g.clone()], true, true),
+            None
+        );
+        assert_eq!(
+            tracker.poll(
+                t0 + Duration::from_secs(10),
+                &[razer.clone(), rx_24g.clone()],
+                true,
+                true
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn input_hotplug_tracker_debounces_arrivals_and_suppresses_glitches_and_self_bounces() {
+        let mut tracker = InputHotplugTracker::new();
+        let t0 = Instant::now();
+        let mouse = mk_ext_device(
+            "mac:mouse:usb:17ef:6225:1110000",
+            kvmddc_platform::ExternalInputKind::Mouse,
+            "tp T50Pro",
+        );
+        let kb = mk_ext_device(
+            "mac:keyboard:usb:258a:010c:1120000",
+            kvmddc_platform::ExternalInputKind::Keyboard,
+            "Gaming Keyboard",
+        );
+        let glitch = mk_ext_device(
+            "mac:mouse:usb:1234:5678:1130000",
+            kvmddc_platform::ExternalInputKind::Mouse,
+            "Glitch Mouse",
+        );
+
+        // Baseline starts empty (hub not yet plugged into this Mac).
+        assert_eq!(tracker.poll(t0, &[], true, true), None);
+
+        // Transient glitch vanishes before 700ms settle window -> never claims.
+        let t1 = t0 + Duration::from_secs(1);
+        assert_eq!(tracker.poll(t1, &[glitch], true, true), None);
+        assert_eq!(
+            tracker.poll(t1 + Duration::from_millis(300), &[], true, true),
+            None
+        );
+        assert_eq!(
+            tracker.poll(t1 + Duration::from_millis(900), &[], true, true),
+            None
+        );
+
+        // Real hub arrives: mouse enumerates at t2, keyboard follows at t2+200ms.
+        let t2 = t0 + Duration::from_secs(3);
+        assert_eq!(tracker.poll(t2, &[mouse.clone()], true, true), None);
+        assert_eq!(
+            tracker.poll(
+                t2 + Duration::from_millis(200),
+                &[mouse.clone(), kb.clone()],
+                true,
+                true
+            ),
+            None
+        );
+
+        // At t2+750ms (>=700ms settle), both devices claim together once; next poll is quiet.
+        let claimed = tracker
+            .poll(
+                t2 + Duration::from_millis(750),
+                &[mouse.clone(), kb.clone()],
+                true,
+                true,
+            )
+            .expect("hub should claim after settle window");
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(
+            tracker.poll(
+                t2 + Duration::from_millis(1200),
+                &[mouse.clone(), kb.clone()],
+                true,
+                true
+            ),
+            None
+        );
+
+        // Brief 1s USB drop + replug (<2.5s self-bounce grace) must NOT re-trigger.
+        let t3 = t0 + Duration::from_secs(10);
+        assert_eq!(tracker.poll(t3, &[], true, true), None);
+        assert_eq!(
+            tracker.poll(
+                t3 + Duration::from_secs(1),
+                &[mouse.clone(), kb.clone()],
+                true,
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            tracker.poll(t3 + Duration::from_secs(2), &[mouse, kb], true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn input_hotplug_tracker_defers_until_accessibility_trusted_and_drops_if_unplugged() {
+        let mut tracker = InputHotplugTracker::new();
+        let t0 = Instant::now();
+        let mouse = mk_ext_device(
+            "mac:mouse:usb:17ef:6225:2110000",
+            kvmddc_platform::ExternalInputKind::Mouse,
+            "tp T50Pro",
+        );
+
+        assert_eq!(tracker.poll(t0, &[], true, false), None);
+        assert_eq!(
+            tracker.poll(t0 + Duration::from_secs(1), &[mouse.clone()], true, false),
+            None
+        );
+        // Settles while macOS Accessibility TCC is still untrusted -> stays deferred.
+        assert_eq!(
+            tracker.poll(t0 + Duration::from_secs(2), &[mouse.clone()], true, false),
+            None
+        );
+        // Once user toggles TCC on while device is still attached -> claims immediately.
+        let claimed = tracker
+            .poll(t0 + Duration::from_millis(2400), &[mouse.clone()], true, true)
+            .expect("deferred device should claim once Accessibility becomes trusted");
+        assert_eq!(claimed, vec![mouse.clone()]);
+
+        // Wait >2.5s unplugged, replug while untrusted, unplug before granting -> never claims.
+        assert_eq!(tracker.poll(t0 + Duration::from_secs(5), &[], true, false), None);
+        assert_eq!(
+            tracker.poll(t0 + Duration::from_secs(9), &[mouse.clone()], true, false),
+            None
+        );
+        assert_eq!(
+            tracker.poll(t0 + Duration::from_secs(10), &[mouse], true, false),
+            None
+        );
+        assert_eq!(
+            tracker.poll(t0 + Duration::from_secs(11), &[], true, false),
+            None
+        );
+        assert_eq!(
+            tracker.poll(t0 + Duration::from_secs(12), &[], true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn peer_shape_change_and_anonymous_tls_disconnect_preserve_active_monitor_focus() {
+        let mut cfg = AppConfig::default_home_setup("macbook", "test-token".to_string());
+        cfg.input_provider_host_id = "macbook".to_string();
+        cfg.allow_plain_slide_to_internal = true;
+
+        let win_host = cfg
+            .hosts
+            .iter()
+            .find(|h| h.id == "win-desktop")
+            .cloned()
+            .unwrap();
+
+        let mut peer_online = HashMap::new();
+        peer_online.insert("macbook".to_string(), true);
+        peer_online.insert("win-desktop".to_string(), true);
+        peer_online.insert("mac-studio".to_string(), false);
+
+        let mut st = LiveState {
+            cfg,
+            deskflow_running: true,
+            deskflow_connected: true,
+            accessibility_trusted: true,
+            display_sleeping: false,
+            saved_ddc_brightness_before_sleep: None,
+            external_display_online: true,
+            local_probe: ConnectedMonitorProbe::default(),
+            local_display_modes: Vec::new(),
+            peer_detected_inputs: HashMap::new(),
+            peer_detected_ports: HashMap::new(),
+            peer_detected_modes: HashMap::new(),
+            peer_display_modes: HashMap::new(),
+            peer_monitor_model: None,
+            active_cursor_host: Some("macbook".to_string()),
+            deskflow_screen_host: Some("macbook".to_string()),
+            observed_monitor_input: Some(win_host.monitor_input),
+            current_brightness: Some(75),
+            current_volume: Some(50),
+            current_color_preset: Some(5),
+            last_clipboard_png_sha: None,
+            last_transfer_summary: None,
+            edge_locked: false,
+            peer_edge_locked: HashMap::new(),
+            clamshell_closed: false,
+            peer_clamshell_closed: HashMap::new(),
+            applied_slide_peer_id: Some("win-desktop".to_string()),
+            applied_mouse_adjustment: None,
+            applied_confined_builtin: true,
+            last_switch_activity_at: Instant::now() - Duration::from_secs(10),
+            secure_input_active: false,
+            last_error: None,
+            peer_online,
+            picker_visible: false,
+            picker_bounds: None,
+            edge_candidates: Vec::new(),
+            hovered_candidate_id: None,
+        };
+
+        // Reconnecting win-desktop while it owns the 27" monitor immediately snaps focus to it.
+        assert_eq!(
+            st.apply_deskflow_log_event(DeskflowLogEvent::PeerClientConnected {
+                host_id: "win-desktop".to_string(),
+            }),
+            Some(("win-desktop".to_string(), win_host.hotkey_slot))
+        );
+        assert_eq!(st.active_cursor_host.as_deref(), Some("win-desktop"));
+
+        // Resolution change / DP wake emits PeerShapeChanged + involuntary reset to macbook:
+        // Kvmddc must refuse stranding on macbook and immediately refocus win-desktop!
+        assert_eq!(
+            st.apply_deskflow_log_event(DeskflowLogEvent::PeerShapeChanged {
+                host_id: "win-desktop".to_string(),
+            }),
+            Some(("win-desktop".to_string(), win_host.hotkey_slot))
+        );
+        assert_eq!(
+            st.apply_deskflow_log_event(DeskflowLogEvent::Switched {
+                from: "win-desktop".to_string(),
+                to: "macbook".to_string(),
+            }),
+            Some(("win-desktop".to_string(), win_host.hotkey_slot))
+        );
+        assert_eq!(st.active_cursor_host.as_deref(), Some("win-desktop"));
+
+        // Anonymous `tls connection closed` from a 3rd peer while win-desktop is online must NOT
+        // drop `deskflow_connected` or reset `active_cursor_host` back to `macbook`.
+        assert_eq!(
+            st.apply_deskflow_log_event(DeskflowLogEvent::ClientDisconnected),
+            None
+        );
+        assert!(st.deskflow_connected);
+        assert_eq!(st.active_cursor_host.as_deref(), Some("win-desktop"));
+
+        // Once shape-change window expires (> 2.2s), a real user slide to open MacBook is honored.
+        *LAST_PEER_SHAPE_CHANGE.lock().unwrap() =
+            Some(("win-desktop".to_string(), Instant::now() - Duration::from_secs(5)));
+        st.last_switch_activity_at = Instant::now() - Duration::from_secs(5);
+        assert_eq!(
+            st.apply_deskflow_log_event(DeskflowLogEvent::Switched {
+                from: "win-desktop".to_string(),
+                to: "macbook".to_string(),
+            }),
+            None
+        );
+        assert_eq!(st.active_cursor_host.as_deref(), Some("macbook"));
+    }
+
+    #[test]
+    fn user_chosen_desktop_resolution_adopts_hd_qhd_uhd_and_rejects_windisc_fallback() {
+        assert!(!is_user_chosen_desktop_resolution(640, 480));
+        assert!(!is_user_chosen_desktop_resolution(1024, 768));
+        assert!(is_user_chosen_desktop_resolution(1280, 720));
+        assert!(is_user_chosen_desktop_resolution(1920, 1080));
+        assert!(is_user_chosen_desktop_resolution(2560, 1440));
+        assert!(is_user_chosen_desktop_resolution(3840, 2160));
+        assert!(is_user_chosen_desktop_resolution(5120, 2880));
+    }
+
+    #[test]
+    fn closed_macbook_accepts_voluntary_switch_from_studio_without_bounce_back() {
+        let mut cfg = AppConfig::default_home_setup("macbook", "tok123".to_string());
+        cfg.input_provider_host_id = "macbook".to_string();
+        for h in &mut cfg.hosts {
+            h.enabled = true;
+            if h.id == "mac-studio" {
+                h.monitor_input = 17;
+            } else if h.id == "win-desktop" {
+                h.monitor_input = 15;
+            }
+        }
+        let mut peer_online = HashMap::new();
+        peer_online.insert("macbook".to_string(), true);
+        peer_online.insert("mac-studio".to_string(), true);
+        peer_online.insert("win-desktop".to_string(), true);
+
+        let mut st = LiveState {
+            cfg,
+            deskflow_running: true,
+            deskflow_connected: true,
+            accessibility_trusted: true,
+            display_sleeping: false,
+            saved_ddc_brightness_before_sleep: None,
+            external_display_online: true,
+            local_probe: ConnectedMonitorProbe::default(),
+            local_display_modes: Vec::new(),
+            peer_detected_inputs: HashMap::new(),
+            peer_detected_ports: HashMap::new(),
+            peer_detected_modes: HashMap::new(),
+            peer_display_modes: HashMap::new(),
+            peer_monitor_model: None,
+            active_cursor_host: Some("mac-studio".to_string()),
+            deskflow_screen_host: Some("mac-studio".to_string()),
+            observed_monitor_input: Some(17),
+            current_brightness: Some(80),
+            current_volume: Some(75),
+            current_color_preset: Some(5),
+            last_clipboard_png_sha: None,
+            last_transfer_summary: None,
+            edge_locked: false,
+            peer_edge_locked: HashMap::new(),
+            clamshell_closed: true, // MacBook lid closed (27" monitor is its only screen!)
+            peer_clamshell_closed: HashMap::new(),
+            applied_slide_peer_id: None,
+            applied_mouse_adjustment: None,
+            applied_confined_builtin: false,
+            last_switch_activity_at: Instant::now(),
+            secure_input_active: false,
+            last_error: None,
+            peer_online,
+            picker_visible: false,
+            picker_bounds: None,
+            edge_candidates: Vec::new(),
+            hovered_candidate_id: None,
+        };
+
+        // Even if /v1/focus arrives while observed_monitor_input is momentarily still 17 (mac-studio),
+        // setting active_cursor_host = Some("macbook") marks the switch voluntary: Deskflow's
+        // `Switched { to: "macbook" }` and `EnteringScreen` MUST NOT bounce back to mac-studio!
+        st.active_cursor_host = Some("macbook".to_string());
+        st.last_switch_activity_at = Instant::now();
+        assert_eq!(st.involuntary_local_reset_escape_target(), None);
+        assert_eq!(
+            st.apply_deskflow_log_event(DeskflowLogEvent::Switched {
+                from: "mac-studio".to_string(),
+                to: "macbook".to_string(),
+            }),
+            None
+        );
+        assert_eq!(
+            st.apply_deskflow_log_event(DeskflowLogEvent::EnteringScreen),
+            None
+        );
+        assert_eq!(st.active_cursor_host.as_deref(), Some("macbook"));
+        assert_eq!(st.deskflow_screen_host.as_deref(), Some("macbook"));
+
+        // Once 27" monitor input is 21 (MacBook), closed-laptop escape returns None because
+        // MacBook IS the active screen on the 27" external monitor.
+        st.observed_monitor_input = Some(21);
+        assert_eq!(st.monitor_escape_target_for_closed_laptop("macbook"), None);
     }
 }

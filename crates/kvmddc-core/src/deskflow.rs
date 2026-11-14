@@ -17,7 +17,10 @@ pub struct TlsIdentity {
 pub enum DeskflowLogEvent {
     Switched { from: String, to: String },
     ClientConnected,
+    PeerClientConnected { host_id: String },
     ClientDisconnected,
+    PeerClientDisconnected { host_id: String },
+    PeerShapeChanged { host_id: String },
     EnteringScreen,
     LeavingScreen,
 }
@@ -392,6 +395,22 @@ pub fn resolve_deskflow_binary(cfg: &AppConfig) -> Result<PathBuf> {
     bail!("未找到 deskflow-core 可执行文件，请检查安装路径")
 }
 
+fn parse_quoted_marker(line: &str, prefix: &str, suffix: &str) -> Option<String> {
+    let idx = line.find(prefix)?;
+    let rest = &line[idx + prefix.len()..];
+    let end_quote = rest.find('"')?;
+    let after_quote = &rest[end_quote + 1..];
+    if after_quote.starts_with(suffix) {
+        Some(rest[..end_quote].to_string())
+    } else {
+        None
+    }
+}
+
+fn parse_peer_client_marker(line: &str, suffix: &str) -> Option<String> {
+    parse_quoted_marker(line, "client \"", suffix)
+}
+
 pub fn parse_deskflow_log_line(line: &str) -> Option<DeskflowLogEvent> {
     if let Some(idx) = line.find("switch from \"") {
         let rest = &line[idx + "switch from \"".len()..];
@@ -404,6 +423,17 @@ pub fn parse_deskflow_log_line(line: &str) -> Option<DeskflowLogEvent> {
         let end_to = rest_to.find('"')?;
         let to = rest_to[..end_to].to_string();
         return Some(DeskflowLogEvent::Switched { from, to });
+    }
+    if let Some(host_id) = parse_quoted_marker(line, "computer \"", " shape changed")
+        .or_else(|| parse_quoted_marker(line, "received client \"", " info shape="))
+    {
+        return Some(DeskflowLogEvent::PeerShapeChanged { host_id });
+    }
+    if let Some(host_id) = parse_peer_client_marker(line, " has connected") {
+        return Some(DeskflowLogEvent::PeerClientConnected { host_id });
+    }
+    if let Some(host_id) = parse_peer_client_marker(line, " has disconnected") {
+        return Some(DeskflowLogEvent::PeerClientDisconnected { host_id });
     }
     if line.contains("accepted client connection")
         || line.contains("accepted secure socket")
@@ -503,6 +533,30 @@ mod tests {
         assert_eq!(
             parse_deskflow_log_line("[2026-11-09T00:36:56.343] INFO: accepted client connection"),
             Some(DeskflowLogEvent::ClientConnected)
+        );
+        assert_eq!(
+            parse_deskflow_log_line("[2026-11-13T23:36:56.343] NOTE: client \"mac-studio\" has connected"),
+            Some(DeskflowLogEvent::PeerClientConnected {
+                host_id: "mac-studio".to_string()
+            })
+        );
+        assert_eq!(
+            parse_deskflow_log_line("[2026-11-13T23:36:57.343] NOTE: client \"mac-studio\" has disconnected"),
+            Some(DeskflowLogEvent::PeerClientDisconnected {
+                host_id: "mac-studio".to_string()
+            })
+        );
+        assert_eq!(
+            parse_deskflow_log_line("[2026-11-14T16:02:10.111] INFO: computer \"win-desktop\" shape changed"),
+            Some(DeskflowLogEvent::PeerShapeChanged {
+                host_id: "win-desktop".to_string()
+            })
+        );
+        assert_eq!(
+            parse_deskflow_log_line("[2026-11-14T16:02:10.112] INFO: received client \"win-desktop\" info shape=0,0 2560x1440 at 1280,720"),
+            Some(DeskflowLogEvent::PeerShapeChanged {
+                host_id: "win-desktop".to_string()
+            })
         );
     }
 }

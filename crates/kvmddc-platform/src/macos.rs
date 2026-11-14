@@ -6,7 +6,7 @@ use anyhow::{bail, ensure, Result};
 use std::ffi::{c_char, c_void};
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicIsize, Ordering},
+    atomic::{AtomicBool, AtomicIsize, Ordering},
     Mutex,
 };
 use std::thread;
@@ -110,6 +110,11 @@ extern "C" {
     ) -> CFTypeRef;
     fn IOServiceMatching(name: *const c_char) -> CFTypeRef;
     fn IOServiceGetMatchingService(main_port: u32, matching: CFTypeRef) -> IoObjectT;
+    fn IOServiceGetMatchingServices(
+        main_port: u32,
+        matching: CFTypeRef,
+        existing: *mut IoIteratorT,
+    ) -> KernReturnT;
     fn IOAVServiceCreateWithService(
         allocator: CFAllocatorRef,
         service: IoObjectT,
@@ -128,6 +133,18 @@ extern "C" {
         input_buffer: *mut u8,
         input_buffer_size: u32,
     ) -> KernReturnT;
+    fn IOPMAssertionCreateWithName(
+        assertion_type: CFStringRef,
+        assertion_level: u32,
+        assertion_name: CFStringRef,
+        assertion_id: *mut u32,
+    ) -> KernReturnT;
+    fn IOPMAssertionDeclareUserActivity(
+        assertion_name: CFStringRef,
+        user_type: u32,
+        assertion_id: *mut u32,
+    ) -> KernReturnT;
+    fn IOPMAssertionRelease(assertion_id: u32) -> KernReturnT;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -135,6 +152,7 @@ extern "C" {
     fn CGEventCreate(source: *const c_void) -> CGEventRef;
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
     fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
+    fn CGEventSourceButtonState(state_id: i32, button: u32) -> bool;
     fn CGEventSourceSecondsSinceLastEventType(state_id: i32, event_type: u32) -> f64;
     fn CGEventCreateKeyboardEvent(
         source: *const c_void,
@@ -154,10 +172,18 @@ extern "C" {
         online_displays: *mut CGDirectDisplayID,
         display_count: *mut u32,
     ) -> i32;
+    fn CGGetActiveDisplayList(
+        max_displays: u32,
+        active_displays: *mut CGDirectDisplayID,
+        display_count: *mut u32,
+    ) -> i32;
     fn CGMainDisplayID() -> CGDirectDisplayID;
     fn CGDisplayBounds(display: CGDirectDisplayID) -> CGRect;
+    fn CGWarpMouseCursorPosition(new_cursor_position: CGPoint) -> i32;
     fn CGDisplayIsBuiltin(display: CGDirectDisplayID) -> u32;
     fn CGDisplayVendorNumber(display: CGDirectDisplayID) -> u32;
+    fn CGDisplayModelNumber(display: CGDirectDisplayID) -> u32;
+    #[allow(dead_code)]
     fn CGDisplayIsCaptured(display: CGDirectDisplayID) -> u32;
     fn CGDisplayCopyDisplayMode(display: CGDirectDisplayID) -> CFTypeRef;
     fn CGDisplayModeRelease(mode: CFTypeRef);
@@ -214,6 +240,8 @@ extern "C" {
 
 static SAVED_BUILTIN_BRIGHTNESS: Mutex<Option<f32>> = Mutex::new(None);
 static REMOTE_SESSION_CACHE: Mutex<Option<(std::time::Instant, bool)>> = Mutex::new(None);
+static DISPLAY_AWAKE_ASSERTION_ID: Mutex<Option<u32>> = Mutex::new(None);
+static USER_WAKE_ASSERTION_ID: Mutex<u32> = Mutex::new(0);
 
 type DisplayServicesGetBrightnessFn = unsafe extern "C" fn(u32, *mut f32) -> i32;
 type DisplayServicesSetBrightnessFn = unsafe extern "C" fn(u32, f32) -> i32;
@@ -451,6 +479,13 @@ fn has_philips_usb_upstream_hub() -> bool {
     }
 }
 
+fn is_virtual_headless_display_id(did: CGDirectDisplayID) -> bool {
+    let (vendor, model) = unsafe { (CGDisplayVendorNumber(did), CGDisplayModelNumber(did)) };
+    (vendor == 2198 && model == 2878)
+        || (vendor == 0x756e6b6e && model == 0x76697274)
+        || (vendor == 21828 && model == 20993)
+}
+
 pub fn probe_connected_monitor() -> ConnectedMonitorProbe {
     let mut found_ext_fb = false;
     let mut model_name: Option<String> = None;
@@ -489,7 +524,10 @@ pub fn probe_connected_monitor() -> ConnectedMonitorProbe {
                                 && !pname
                                     .as_deref()
                                     .is_some_and(|n| n.contains("Studio") || n.contains("Pro Display"));
-                            if !is_builtin_apple && (mfg.is_some() || pname.is_some()) {
+                            let is_virtual_display = pname
+                                .as_deref()
+                                .is_some_and(|n| n == "Mac Retina P3" || n.contains("UU远程"));
+                            if !is_builtin_apple && !is_virtual_display && (mfg.is_some() || pname.is_some()) {
                                 found_ext_fb = true;
                                 if let Some(pn) = pname {
                                     if !pn.is_empty() {
@@ -557,7 +595,7 @@ pub fn probe_connected_monitor() -> ConnectedMonitorProbe {
         if CGGetOnlineDisplayList(16, ids.as_mut_ptr(), &mut cnt) == 0 {
             let mut chosen: Option<u32> = None;
             for &did in &ids[..cnt as usize] {
-                if CGDisplayIsBuiltin(did) == 0 {
+                if CGDisplayIsBuiltin(did) == 0 && !is_virtual_headless_display_id(did) {
                     // Ignore dummy/virtual displays without vendor or pick Philips 0x410C (16652)
                     let vendor = CGDisplayVendorNumber(did);
                     if vendor == 16652 || (chosen.is_none() && found_ext_fb) {
@@ -612,7 +650,9 @@ pub fn probe_connected_monitor() -> ConnectedMonitorProbe {
     } else if usb_hub {
         (Some(21), Some("USB-C".to_string()), Some(96))
     } else {
-        (Some(15), Some("DP 1.4".to_string()), None)
+        // USB-C DP Alt-Mode drops the monitor's internal USB hub when the OSD switches to
+        // another input; avoid misidentifying an inactive USB-C link as native DP 1.4 (15).
+        (None, None, None)
     };
 
     ConnectedMonitorProbe {
@@ -896,9 +936,8 @@ pub fn list_display_modes(prefer_external: bool) -> Vec<DisplayModeOption> {
         .as_ref()
         .map(|m| m.width as f32 / m.height.max(1) as f32)
         .unwrap_or(if is_builtin { 1512.0 / 982.0 } else { 16.0 / 9.0 });
-    let target_hz = cur_opt.as_ref().map(|m| m.hz).unwrap_or(60);
     let target_depth = cur_opt.as_ref().map(|m| m.depth).unwrap_or(4);
-    let max_native_w = raw_list.iter().map(|m| m.width).max().unwrap_or(2560);
+    let _max_native_w = raw_list.iter().map(|m| m.width).max().unwrap_or(2560);
 
     let mut buckets: std::collections::BTreeMap<(u32, u32, bool), RawCgsMode> =
         std::collections::BTreeMap::new();
@@ -921,12 +960,10 @@ pub fn list_display_modes(prefer_external: bool) -> Vec<DisplayModeOption> {
                 if m.current {
                     buckets.insert(key, m);
                 } else if !existing.current {
-                    let existing_score = ((existing.hz == target_hz) as u8) * 4
-                        + ((existing.depth == target_depth) as u8) * 2
-                        + (existing.hz.min(240) as u8 / 30);
-                    let new_score = ((m.hz == target_hz) as u8) * 4
-                        + ((m.depth == target_depth) as u8) * 2
-                        + (m.hz.min(240) as u8 / 30);
+                    let existing_score =
+                        ((existing.depth == target_depth) as u32) * 1000 + existing.hz.min(500);
+                    let new_score =
+                        ((m.depth == target_depth) as u32) * 1000 + m.hz.min(500);
                     if new_score > existing_score {
                         buckets.insert(key, m);
                     }
@@ -990,6 +1027,14 @@ pub fn apply_display_mode(
         .iter()
         .find(|m| mode_id >= 0 && m.mode_id == mode_id)
         .or_else(|| {
+            modes.iter().find(|m| {
+                m.width == width
+                    && m.height == height
+                    && m.hidpi == hidpi
+                    && (hz == 0 || m.hz == hz)
+            })
+        })
+        .or_else(|| {
             modes
                 .iter()
                 .find(|m| m.width == width && m.height == height && m.hidpi == hidpi)
@@ -1003,11 +1048,22 @@ pub fn apply_display_mode(
         .or_else(|| {
             let raw_all = read_cgs_modes_for_display(did);
             raw_all
-                .into_iter()
-                .find(|m| {
-                    (mode_id >= 0 && m.mode_id == mode_id)
-                        || (m.width == width && m.height == height && m.hidpi == hidpi)
+                .iter()
+                .find(|m| mode_id >= 0 && m.mode_id == mode_id)
+                .or_else(|| {
+                    raw_all.iter().find(|m| {
+                        m.width == width
+                            && m.height == height
+                            && m.hidpi == hidpi
+                            && (hz == 0 || m.hz == hz)
+                    })
                 })
+                .or_else(|| {
+                    raw_all
+                        .iter()
+                        .find(|m| m.width == width && m.height == height && m.hidpi == hidpi)
+                })
+                .cloned()
                 .map(|m| {
                     let suffix = if m.hidpi { "HiDPI" } else { "原生" };
                     DisplayModeOption {
@@ -1115,6 +1171,59 @@ pub fn apply_software_gamma(
     Ok(())
 }
 
+static BUILTIN_DISPLAY_CONFINED: AtomicBool = AtomicBool::new(false);
+
+fn find_builtin_display_id() -> Option<CGDirectDisplayID> {
+    unsafe {
+        let mut ids = [0 as CGDirectDisplayID; 16];
+        let mut count: u32 = 0;
+        let rc = CGGetOnlineDisplayList(16, ids.as_mut_ptr(), &mut count);
+        if rc != 0 || count == 0 {
+            return None;
+        }
+        ids[..(count as usize).min(16)]
+            .iter()
+            .copied()
+            .find(|&did| CGDisplayIsBuiltin(did) != 0)
+    }
+}
+
+pub fn set_builtin_display_confined(confined: bool) {
+    BUILTIN_DISPLAY_CONFINED.store(confined, Ordering::Relaxed);
+}
+
+pub fn clamp_cursor_to_builtin_if_needed() -> bool {
+    unsafe {
+        let Some(builtin_id) = find_builtin_display_id() else {
+            return false;
+        };
+        let b = CGDisplayBounds(builtin_id);
+        if b.size.width <= 4.0 || b.size.height <= 4.0 {
+            return false;
+        }
+        let ev = CGEventCreate(std::ptr::null());
+        if ev.is_null() {
+            return false;
+        }
+        let pt = CGEventGetLocation(ev);
+        CFRelease(ev as CFTypeRef);
+
+        let min_x = b.origin.x;
+        let max_x = b.origin.x + b.size.width - 1.0;
+        let min_y = b.origin.y;
+        let max_y = b.origin.y + b.size.height - 1.0;
+        if pt.x >= min_x && pt.x <= max_x && pt.y >= min_y && pt.y <= max_y {
+            return false;
+        }
+
+        let target = CGPoint {
+            x: pt.x.clamp(min_x + 2.0, max_x - 2.0),
+            y: pt.y.clamp(min_y + 2.0, max_y - 2.0),
+        };
+        CGWarpMouseCursorPosition(target) == 0
+    }
+}
+
 pub fn sample_pointer_and_ctrl() -> Option<PointerSample> {
     unsafe {
         let ev = CGEventCreate(std::ptr::null());
@@ -1124,17 +1233,29 @@ pub fn sample_pointer_and_ctrl() -> Option<PointerSample> {
         let pt = CGEventGetLocation(ev);
         CFRelease(ev as CFTypeRef);
 
-        let mut disp_id: CGDirectDisplayID = 0;
-        let mut count: u32 = 0;
-        let rc = CGGetDisplaysWithPoint(pt, 1, &mut disp_id, &mut count);
-        let target_disp = if rc == 0 && count > 0 {
-            disp_id
+        let confined_builtin = BUILTIN_DISPLAY_CONFINED
+            .load(Ordering::Relaxed)
+            .then(find_builtin_display_id)
+            .flatten();
+
+        let target_disp = if let Some(bid) = confined_builtin {
+            bid
         } else {
-            CGMainDisplayID()
+            let mut disp_id: CGDirectDisplayID = 0;
+            let mut count: u32 = 0;
+            let rc = CGGetDisplaysWithPoint(pt, 1, &mut disp_id, &mut count);
+            if rc == 0 && count > 0 {
+                disp_id
+            } else {
+                CGMainDisplayID()
+            }
         };
         let bounds = CGDisplayBounds(target_disp);
         let ctrl_down = CGEventSourceKeyState(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE, 0x3B)
             || CGEventSourceKeyState(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE, 0x3E);
+        let mouse_down = CGEventSourceButtonState(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE, 0)
+            || CGEventSourceButtonState(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE, 1)
+            || CGEventSourceButtonState(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE, 2);
 
         let left = bounds.origin.x.round() as i32;
         let top = bounds.origin.y.round() as i32;
@@ -1149,6 +1270,7 @@ pub fn sample_pointer_and_ctrl() -> Option<PointerSample> {
             screen_right: right,
             screen_bottom: bottom,
             ctrl_down,
+            mouse_down,
         })
     }
 }
@@ -1158,6 +1280,14 @@ pub fn is_outer_desktop_edge(x: i32, y: i32, side: EdgeSide) -> bool {
         EdgeSide::Left => (x - 16) as f64,
         EdgeSide::Right => (x + 16) as f64,
     };
+    if BUILTIN_DISPLAY_CONFINED.load(Ordering::Relaxed) {
+        if let Some(bid) = find_builtin_display_id() {
+            let b = unsafe { CGDisplayBounds(bid) };
+            let min_x = b.origin.x;
+            let max_x = b.origin.x + b.size.width;
+            return probe_x < min_x || probe_x >= max_x;
+        }
+    }
     let pt = CGPoint {
         x: probe_x,
         y: y as f64,
@@ -1270,7 +1400,6 @@ pub fn is_remote_session_active() -> bool {
         .map(|out| {
             let text = String::from_utf8_lossy(&out.stdout);
             text.contains("UURemote Disable Display Sleep")
-                || text.contains("process:UURemoteServer")
                 || text.contains("screensharingd")
                 || text.contains("RFBRegisterMDNSService")
         })
@@ -1531,4 +1660,234 @@ pub fn kill_other_kvmddc_instances() {
             }
         }
     }
+}
+
+/// Returns how many CoreGraphics displays are currently awake & active (excludes asleep/blanked displays).
+pub fn active_display_count() -> u32 {
+    unsafe {
+        let mut ids = [0u32; 16];
+        let mut cnt = 0u32;
+        if CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut cnt) == 0 {
+            cnt
+        } else {
+            0
+        }
+    }
+}
+
+/// Declares local user activity so macOS wakes any display currently sitting in OS display sleep.
+pub fn wake_idle_display_for_kvm() {
+    let Ok(cf_name) = make_cfstring(b"Kvmddc Deskflow active display wake\0") else {
+        return;
+    };
+    if let Ok(mut id) = USER_WAKE_ASSERTION_ID.lock() {
+        unsafe {
+            let _ = IOPMAssertionDeclareUserActivity(cf_name.0, 0, &mut *id);
+        }
+    }
+}
+
+/// Holds or releases `PreventUserIdleDisplaySleep` so macOS never drops `CGGetActiveDisplayList`
+/// to 0 on headless / switched-away Macs (which otherwise crashes `deskflow-core` with
+/// "failed to initialize computer shape").
+pub fn ensure_display_sleep_prevented(enabled: bool) {
+    let Ok(mut guard) = DISPLAY_AWAKE_ASSERTION_ID.lock() else {
+        return;
+    };
+    if enabled {
+        if guard.is_none() {
+            if let (Ok(cf_type), Ok(cf_name)) = (
+                make_cfstring(b"PreventUserIdleDisplaySleep\0"),
+                make_cfstring(b"Kvmddc keep Deskflow display awake\0"),
+            ) {
+                let mut assertion_id = 0u32;
+                let kr = unsafe {
+                    IOPMAssertionCreateWithName(
+                        cf_type.0,
+                        255, // kIOPMAssertionLevelOn
+                        cf_name.0,
+                        &mut assertion_id,
+                    )
+                };
+                if kr == 0 && assertion_id != 0 {
+                    *guard = Some(assertion_id);
+                }
+            }
+        }
+        drop(guard);
+        if active_display_count() == 0 {
+            wake_idle_display_for_kvm();
+        }
+    } else if let Some(assertion_id) = guard.take() {
+        unsafe {
+            let _ = IOPMAssertionRelease(assertion_id);
+        }
+    }
+}
+
+unsafe fn io_registry_bool_prop(entry: IoRegistryEntryT, key: &[u8]) -> Option<bool> {
+    let cf_key = make_cfstring(key).ok()?;
+    let prop = IORegistryEntryCreateCFProperty(entry, cf_key.0, std::ptr::null(), 0);
+    if prop.is_null() {
+        return None;
+    }
+    let res = if CFGetTypeID(prop) == CFBooleanGetTypeID() {
+        Some(CFBooleanGetValue(prop))
+    } else {
+        None
+    };
+    CFRelease(prop);
+    res
+}
+
+unsafe fn io_registry_i64_prop(entry: IoRegistryEntryT, key: &[u8]) -> Option<i64> {
+    let cf_key = make_cfstring(key).ok()?;
+    let prop = IORegistryEntryCreateCFProperty(entry, cf_key.0, std::ptr::null(), 0);
+    if prop.is_null() {
+        return None;
+    }
+    let res = cf_number_to_i64(prop);
+    CFRelease(prop);
+    res
+}
+
+unsafe fn io_registry_string_prop(entry: IoRegistryEntryT, key: &[u8]) -> Option<String> {
+    let cf_key = make_cfstring(key).ok()?;
+    let prop = IORegistryEntryCreateCFProperty(entry, cf_key.0, std::ptr::null(), 0);
+    if prop.is_null() {
+        return None;
+    }
+    let res = cf_string_to_rust(prop);
+    CFRelease(prop);
+    res
+}
+
+pub fn list_external_input_devices() -> Vec<crate::ExternalInputDevice> {
+    let mut devices = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    unsafe {
+        let matching = IOServiceMatching(b"IOHIDDevice\0".as_ptr() as *const c_char);
+        if matching.is_null() {
+            return devices;
+        }
+        let mut iter: IoIteratorT = 0;
+        let kr = IOServiceGetMatchingServices(0, matching, &mut iter);
+        if kr != 0 || iter == 0 {
+            return devices;
+        }
+        loop {
+            let entry = IOIteratorNext(iter);
+            if entry == 0 {
+                break;
+            }
+            let built_in = io_registry_bool_prop(entry, b"Built-In\0");
+            let transport = io_registry_string_prop(entry, b"Transport\0");
+            let usage_page = io_registry_i64_prop(entry, b"PrimaryUsagePage\0");
+            let usage = io_registry_i64_prop(entry, b"PrimaryUsage\0");
+            let vendor_id = io_registry_i64_prop(entry, b"VendorID\0");
+            let product_id = io_registry_i64_prop(entry, b"ProductID\0");
+            let location_id = io_registry_i64_prop(entry, b"LocationID\0");
+            let product = io_registry_string_prop(entry, b"Product\0");
+            if let Some(dev) = crate::classify_macos_hid_device(
+                built_in,
+                transport.as_deref(),
+                usage_page,
+                usage,
+                vendor_id,
+                product_id,
+                location_id,
+                product.as_deref(),
+            ) {
+                if seen.insert(dev.device_key.clone()) {
+                    devices.push(dev);
+                }
+            }
+            IOObjectRelease(entry);
+        }
+        IOObjectRelease(iter);
+    }
+    devices.sort();
+    devices
+}
+
+#[repr(C)]
+struct DarwinIfAddrs {
+    ifa_next: *mut DarwinIfAddrs,
+    ifa_name: *const c_char,
+    ifa_flags: u32,
+    ifa_addr: *mut DarwinSockAddr,
+    ifa_netmask: *mut DarwinSockAddr,
+    ifa_dstaddr: *mut DarwinSockAddr,
+    ifa_data: *mut c_void,
+}
+
+#[repr(C)]
+struct DarwinSockAddr {
+    sa_len: u8,
+    sa_family: u8,
+    sa_data: [u8; 14],
+}
+
+#[repr(C)]
+struct DarwinSockAddrIn {
+    sin_len: u8,
+    sin_family: u8,
+    sin_port: u16,
+    sin_addr: [u8; 4],
+    sin_zero: [u8; 8],
+}
+
+extern "C" {
+    fn getifaddrs(ifap: *mut *mut DarwinIfAddrs) -> i32;
+    fn freeifaddrs(ifa: *mut DarwinIfAddrs);
+}
+
+/// Returns active non-loopback IPv4 addresses on macOS interfaces (`getifaddrs`),
+/// ordering persistent built-in interfaces (`en0`, `en1`) ahead of external USB/dock NICs.
+pub fn list_local_ipv4_addrs() -> Vec<String> {
+    const IFF_UP: u32 = 0x1;
+    const IFF_LOOPBACK: u32 = 0x8;
+    const AF_INET: u8 = 2;
+
+    let mut ranked: Vec<(u8, usize, String)> = Vec::new();
+    let mut head: *mut DarwinIfAddrs = std::ptr::null_mut();
+    unsafe {
+        if getifaddrs(&mut head) != 0 || head.is_null() {
+            return Vec::new();
+        }
+        let mut cur = head;
+        let mut idx = 0usize;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            if (ifa.ifa_flags & IFF_UP) != 0
+                && (ifa.ifa_flags & IFF_LOOPBACK) == 0
+                && !ifa.ifa_addr.is_null()
+                && (*ifa.ifa_addr).sa_family == AF_INET
+            {
+                let if_name = if ifa.ifa_name.is_null() {
+                    ""
+                } else {
+                    std::ffi::CStr::from_ptr(ifa.ifa_name).to_str().unwrap_or("")
+                };
+                let prio = match if_name {
+                    "en0" => 0,
+                    "en1" => 1,
+                    _ => 2,
+                };
+                let sin = &*(ifa.ifa_addr as *const DarwinSockAddrIn);
+                let ip = std::net::Ipv4Addr::from(sin.sin_addr);
+                if !ip.is_unspecified() && !ip.is_loopback() {
+                    let s = ip.to_string();
+                    if !ranked.iter().any(|(_, _, existing)| existing == &s) {
+                        ranked.push((prio, idx, s));
+                        idx += 1;
+                    }
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        freeifaddrs(head);
+    }
+    ranked.sort_by_key(|(prio, idx, _)| (*prio, *idx));
+    ranked.into_iter().map(|(_, _, ip)| ip).collect()
 }

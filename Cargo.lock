@@ -1800,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "kvmddc"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1817,7 +1817,7 @@ dependencies = [
 
 [[package]]
 name = "kvmddc-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1837,7 +1837,7 @@ dependencies = [
 
 [[package]]
 name = "kvmddc-platform"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "png",
