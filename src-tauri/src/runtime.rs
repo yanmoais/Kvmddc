@@ -460,6 +460,7 @@ pub struct AppRuntime {
     state: RwLock<LiveState>,
     ddc_notify: Notify,
     deskflow_reload_notify: Notify,
+    focus_watchdog_notify: Notify,
     standby_notify: Notify,
     picker_cb: RwLock<Option<EdgePickerCallback>>,
     blanker_cb: RwLock<Option<StandbyBlankerCallback>>,
@@ -710,6 +711,7 @@ impl AppRuntime {
             }),
             ddc_notify: Notify::new(),
             deskflow_reload_notify: Notify::new(),
+            focus_watchdog_notify: Notify::new(),
             standby_notify: Notify::new(),
             picker_cb: RwLock::new(None),
             blanker_cb: RwLock::new(None),
@@ -789,6 +791,11 @@ impl AppRuntime {
         let s9 = Arc::clone(self);
         tokio::spawn(async move {
             s9.run_hid_hotplug_loop().await;
+        });
+
+        let s10 = Arc::clone(self);
+        tokio::spawn(async move {
+            s10.run_focus_escape_watchdog_loop().await;
         });
     }
 
@@ -886,9 +893,8 @@ impl AppRuntime {
 
     async fn run_deskflow_supervisor_loop(self: Arc<Self>) {
         loop {
-            let (cfg_snapshot, any_edge_locked, _ext_online, slide_peer, mouse_adj, confine_builtin, entered_confined) = {
+            let (cfg_snapshot, _ext_online, slide_peer, mouse_adj, confine_builtin, entered_confined) = {
                 let mut st = self.state.write().await;
-                let session_locked = st.is_deskflow_session_locked();
                 let sp = st.effective_plain_slide_peer_id();
                 let madj = compute_deskflow_mouse_adjustment(&st.cfg, st.observed_monitor_input);
                 let prev_confined = st.applied_confined_builtin;
@@ -898,7 +904,6 @@ impl AppRuntime {
                 st.applied_confined_builtin = confine;
                 (
                     st.cfg.clone(),
-                    session_locked,
                     st.external_display_online || st.observed_monitor_input.is_some(),
                     sp,
                     madj,
@@ -913,7 +918,10 @@ impl AppRuntime {
                 let _ = tokio::task::spawn_blocking(kvmddc_platform::clamp_cursor_to_builtin_if_needed).await;
             }
 
-            if !cfg_snapshot.deskflow_enabled || any_edge_locked {
+            // Keep `deskflow-core` alive during incoming remote desktop sessions (`edge_locked`);
+            // screen edges (`plain_slide` and `ctrl_edge`) are already locked while `edge_locked`
+            // is true, so explicit slot hotkeys and `/v1/focus-input` remain operational.
+            if !cfg_snapshot.deskflow_enabled {
                 let _ = tokio::task::spawn_blocking(|| {
                     kvmddc_platform::ensure_display_sleep_prevented(false);
                     kvmddc_platform::kill_orphan_deskflow_processes();
@@ -955,8 +963,9 @@ impl AppRuntime {
             #[cfg(target_os = "macos")]
             {
                 // Avoid a 5-second `deskflow-core` launch/crash loop when macOS Accessibility is
-                // not yet trusted on this machine; keep the display sleep assertion held and wait
-                // quietly until `run_display_guardian_loop` wakes us via `deskflow_reload_notify`.
+                // not yet trusted on this machine (macOS TCC attributes child `deskflow-core`
+                // event injection to parent `Kvmddc.app`); keep the display sleep assertion held
+                // and wait quietly until `run_display_guardian_loop` wakes us.
                 let ax_trusted = tokio::task::spawn_blocking(kvmddc_platform::is_accessibility_trusted)
                     .await
                     .unwrap_or(false);
@@ -1608,14 +1617,8 @@ impl AppRuntime {
                                 && remote.is_input_provider
                                 && remote.deskflow_running;
                             st.peer_online.insert(peer.id.clone(), true);
-                            if st
-                                .peer_edge_locked
-                                .insert(peer.id.clone(), remote.edge_locked)
-                                .unwrap_or(false)
-                                != remote.edge_locked
-                            {
-                                peer_lock_changed = true;
-                            }
+                            st.peer_edge_locked
+                                .insert(peer.id.clone(), remote.edge_locked);
                             st.peer_clamshell_closed
                                 .insert(peer.id.clone(), remote.clamshell_closed);
                             if remote.is_ddc_controller {
@@ -1800,9 +1803,9 @@ impl AppRuntime {
                         let reload_df = {
                             let mut st = self.state.write().await;
                             st.peer_online.insert(peer.id.clone(), false);
-                            let had_lock = st.peer_edge_locked.remove(&peer.id).unwrap_or(false);
+                            st.peer_edge_locked.remove(&peer.id);
                             st.peer_clamshell_closed.remove(&peer.id);
-                            had_lock || st.should_reload_deskflow_links()
+                            st.should_reload_deskflow_links()
                         };
                         if reload_df {
                             self.deskflow_reload_notify.notify_one();
@@ -1883,6 +1886,7 @@ impl AppRuntime {
             let ext_online = probe.connected;
             let mut reload_df = false;
             let mut lid_escape: Option<(String, u8, Option<(String, u16, String)>)> = None;
+            let mut remote_reclaim_local_slot: Option<u8> = None;
             {
                 let mut st = self.state.write().await;
                 if !st.accessibility_trusted && ax_ok {
@@ -1974,8 +1978,17 @@ impl AppRuntime {
                     }
                 }
                 if st.edge_locked != locked {
+                    let entered_remote = !st.edge_locked && locked;
                     st.edge_locked = locked;
-                    reload_df = true;
+                    if entered_remote
+                        && st.cfg.is_input_provider()
+                        && st.active_cursor_host.as_deref() != Some(st.cfg.local_host_id.as_str())
+                    {
+                        st.active_cursor_host = Some(st.cfg.local_host_id.clone());
+                        st.last_switch_activity_at = Instant::now();
+                        remote_reclaim_local_slot =
+                            st.cfg.local_host().ok().map(|h| h.hotkey_slot);
+                    }
                 }
                 let confine = st.should_confine_builtin_display();
                 st.applied_confined_builtin = confine;
@@ -1985,6 +1998,14 @@ impl AppRuntime {
                     reload_df = true;
                 }
                 st.secure_input_active = sec_in;
+            }
+
+            if let Some(local_slot) = remote_reclaim_local_slot {
+                let _ = tokio::task::spawn_blocking(move || {
+                    kvmddc_platform::trigger_internal_deskflow_slot(local_slot)
+                })
+                .await;
+                self.focus_watchdog_notify.notify_one();
             }
 
             if let Some((esc_id, esc_slot, remote_provider)) = lid_escape {
@@ -2432,6 +2453,7 @@ impl AppRuntime {
         }
         let focus_seq = FOCUS_FOLLOWUP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if is_provider {
+            self.focus_watchdog_notify.notify_one();
             let _ = tokio::task::spawn_blocking(move || {
                 kvmddc_platform::trigger_internal_deskflow_slot(slot)
             })
@@ -3182,8 +3204,11 @@ impl AppRuntime {
     }
 
     async fn run_clipboard_image_sync_loop(self: Arc<Self>) {
-        if let Ok(Some(initial_png)) =
-            tokio::task::spawn_blocking(kvmddc_platform::read_clipboard_png).await
+        if let Ok(Ok(Some(initial_png))) = tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::task::spawn_blocking(kvmddc_platform::read_clipboard_png),
+        )
+        .await
         {
             let sha = sha256_hex_bytes(&initial_png);
             self.state.write().await.last_clipboard_png_sha = Some(sha);
@@ -3192,7 +3217,7 @@ impl AppRuntime {
         loop {
             tokio::time::sleep(Duration::from_millis(1800)).await;
 
-            let (online_peer_ips, port, token) = {
+            let (sleeping, online_peer_ips, port, token) = {
                 let st = self.state.read().await;
                 let ips: Vec<String> = st
                     .cfg
@@ -3205,15 +3230,23 @@ impl AppRuntime {
                     })
                     .map(|h| h.lan_ip.clone())
                     .collect();
-                (ips, st.cfg.control_port, st.cfg.shared_token.clone())
+                (
+                    st.display_sleeping,
+                    ips,
+                    st.cfg.control_port,
+                    st.cfg.shared_token.clone(),
+                )
             };
 
-            if online_peer_ips.is_empty() {
+            if sleeping || online_peer_ips.is_empty() {
                 continue;
             }
 
-            let Ok(Some(png_bytes)) =
-                tokio::task::spawn_blocking(kvmddc_platform::read_clipboard_png).await
+            let Ok(Ok(Some(png_bytes))) = tokio::time::timeout(
+                Duration::from_secs(3),
+                tokio::task::spawn_blocking(kvmddc_platform::read_clipboard_png),
+            )
+            .await
             else {
                 continue;
             };
@@ -3286,6 +3319,35 @@ impl AppRuntime {
             }
 
             tokio::time::sleep(HID_HOTPLUG_POLL_INTERVAL).await;
+        }
+    }
+
+    async fn run_focus_escape_watchdog_loop(self: Arc<Self>) {
+        loop {
+            self.focus_watchdog_notify.notified().await;
+            let start_seq = FOCUS_FOLLOWUP_SEQ.load(std::sync::atomic::Ordering::Relaxed);
+            let Some(target_id) = FOCUS_FOLLOWUP_TARGET.lock().ok().and_then(|g| g.clone()) else {
+                continue;
+            };
+
+            for (step_wait_ms, total_elapsed_ms) in [(420_u64, 420_u64), (500_u64, 920_u64)] {
+                tokio::time::sleep(Duration::from_millis(step_wait_ms)).await;
+                if FOCUS_FOLLOWUP_SEQ.load(std::sync::atomic::Ordering::Relaxed) != start_seq {
+                    break;
+                }
+                let should_reload = {
+                    let st = self.state.read().await;
+                    st.needs_focus_escape_reload(&target_id, total_elapsed_ms)
+                };
+                if should_reload {
+                    FOCUS_FOLLOWUP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "[kvmddc] focus watchdog: deskflow stuck after {total_elapsed_ms}ms (target={target_id}), reloading to reclaim input"
+                    );
+                    self.deskflow_reload_notify.notify_one();
+                    break;
+                }
+            }
         }
     }
 
@@ -4342,7 +4404,7 @@ impl ControlPlaneHandler for AppRuntime {
     fn handle_focus_input(&self, req: FocusInputRequest) -> BoxFuture<'_, Result<ActionAck>> {
         Box::pin(async move {
             CLIENT_REFOCUS_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            {
+            let reload_df = {
                 let mut st = self.state.write().await;
                 st.last_switch_activity_at = Instant::now();
                 st.active_cursor_host = Some(req.target_host_id.clone());
@@ -4351,16 +4413,20 @@ impl ControlPlaneHandler for AppRuntime {
                     .hosts
                     .iter()
                     .find(|h| h.enabled && h.id == req.target_host_id)
-                    .filter(|h| {
-                        h.display_profile.has_internal_screen
-                            && st.is_host_clamshell_closed(&h.id)
-                    })
                     .map(|h| h.monitor_input)
                 {
                     st.observed_monitor_input = Some(th_in);
                 }
+                let confine = st.should_confine_builtin_display();
+                st.applied_confined_builtin = confine;
+                kvmddc_platform::set_builtin_display_confined(confine);
+                sync_confine_builtin_flag(&self.data_dir, confine);
+                st.should_reload_deskflow_links()
+            };
+            if reload_df {
+                self.deskflow_reload_notify.notify_one();
             }
-            self.focus_deskflow_on_host(&req.target_host_id, req.hotkey_slot, &[250, 900])
+            self.focus_deskflow_on_host(&req.target_host_id, req.hotkey_slot, &[250, 800, 1800])
                 .await;
             Ok(ActionAck {
                 ok: true,
@@ -4603,6 +4669,36 @@ impl LiveState {
         let deskflow_link_up = !self.cfg.deskflow_enabled || self.deskflow_connected;
         if !peer_online || peer_locked || !deskflow_link_up {
             self.active_cursor_host = Some(self.cfg.local_host_id.clone());
+        }
+    }
+
+    /// Returns `true` when `deskflow-core` on the active input provider is wedged on a remote
+    /// screen and ignored synthetic `F18/F19/F20` slot switches past the escape deadline:
+    /// - Returning to `local_host_id`: after `>= 420ms` (`0ms` + `250ms` slot attempts), if
+    ///   `active_cursor_host == Some(local_host_id)` yet `deskflow_screen_host` is still on a
+    ///   remote screen, reload `deskflow-core` so its `CGEventTap` releases local input immediately.
+    /// - Switching to an online remote peer `B` while wedged on a different remote peer `A`
+    ///   (`cur_df != local_host_id && cur_df != B`): after `>= 920ms` (`0ms`, `250ms`, `800ms`),
+    ///   reload `deskflow-core` to break out of `A` without reload-looping when `cur_df == local_host_id`.
+    fn needs_focus_escape_reload(&self, target_host_id: &str, elapsed_ms: u64) -> bool {
+        if !self.cfg.is_input_provider() || !self.cfg.deskflow_enabled || !self.deskflow_running {
+            return false;
+        }
+        if self.active_cursor_host.as_deref() != Some(target_host_id) {
+            return false;
+        }
+        let Some(cur_df) = self.deskflow_screen_host.as_deref() else {
+            return false;
+        };
+        if cur_df == target_host_id {
+            return false;
+        }
+        let local_id = self.cfg.local_host_id.as_str();
+        if target_host_id == local_id {
+            elapsed_ms >= 420 && cur_df != local_id
+        } else {
+            let target_online = self.peer_online.get(target_host_id).copied().unwrap_or(false);
+            elapsed_ms >= 920 && target_online && cur_df != local_id
         }
     }
 
@@ -5898,5 +5994,85 @@ mod tests {
         // MacBook IS the active screen on the 27" external monitor.
         st.observed_monitor_input = Some(21);
         assert_eq!(st.monitor_escape_target_for_closed_laptop("macbook"), None);
+    }
+
+    #[test]
+    fn focus_escape_watchdog_reclaims_trapped_local_and_wedged_remote_without_false_positives() {
+        let mut cfg = AppConfig::default_home_setup("mac-studio", "tok123".to_string());
+        cfg.input_provider_host_id = "mac-studio".to_string();
+        for h in &mut cfg.hosts {
+            h.enabled = true;
+            if h.id == "mac-studio" {
+                h.monitor_input = 17;
+            } else if h.id == "win-desktop" {
+                h.monitor_input = 15;
+            }
+        }
+        let mut peer_online = HashMap::new();
+        peer_online.insert("mac-studio".to_string(), true);
+        peer_online.insert("macbook".to_string(), true);
+        peer_online.insert("win-desktop".to_string(), true);
+
+        let mut st = LiveState {
+            cfg,
+            deskflow_running: true,
+            deskflow_connected: true,
+            accessibility_trusted: true,
+            display_sleeping: false,
+            saved_ddc_brightness_before_sleep: None,
+            external_display_online: true,
+            local_probe: ConnectedMonitorProbe::default(),
+            local_display_modes: Vec::new(),
+            peer_detected_inputs: HashMap::new(),
+            peer_detected_ports: HashMap::new(),
+            peer_detected_modes: HashMap::new(),
+            peer_display_modes: HashMap::new(),
+            peer_monitor_model: None,
+            active_cursor_host: Some("mac-studio".to_string()),
+            deskflow_screen_host: Some("macbook".to_string()),
+            observed_monitor_input: Some(17),
+            current_brightness: Some(80),
+            current_volume: Some(75),
+            current_color_preset: Some(5),
+            last_clipboard_png_sha: None,
+            last_transfer_summary: None,
+            edge_locked: false,
+            peer_edge_locked: HashMap::new(),
+            clamshell_closed: false,
+            peer_clamshell_closed: HashMap::new(),
+            applied_slide_peer_id: None,
+            applied_mouse_adjustment: None,
+            applied_confined_builtin: false,
+            last_switch_activity_at: Instant::now(),
+            secure_input_active: false,
+            last_error: None,
+            peer_online,
+            picker_visible: false,
+            picker_bounds: None,
+            edge_candidates: Vec::new(),
+            hovered_candidate_id: None,
+        };
+
+        // 1. Returning to local provider (`mac-studio`) while Deskflow stays wedged on `macbook`:
+        // waits until >= 420ms, then forces reload to reclaim keyboard/mouse.
+        assert!(!st.needs_focus_escape_reload("mac-studio", 250));
+        assert!(st.needs_focus_escape_reload("mac-studio", 420));
+
+        // Once Deskflow reports EnteringScreen / Switched to `mac-studio`, watchdog does nothing.
+        st.deskflow_screen_host = Some("mac-studio".to_string());
+        assert!(!st.needs_focus_escape_reload("mac-studio", 420));
+
+        // 2. Switching from local `mac-studio` to `win-desktop` while `win-desktop` is still
+        // connecting (`cur_df == "mac-studio" == local_id`) must NEVER trigger a reload loop!
+        st.active_cursor_host = Some("win-desktop".to_string());
+        st.deskflow_screen_host = Some("mac-studio".to_string());
+        assert!(!st.needs_focus_escape_reload("win-desktop", 420));
+        assert!(!st.needs_focus_escape_reload("win-desktop", 920));
+
+        // 3. Switching from wedged remote `macbook` to online remote `win-desktop`:
+        // waits until >= 920ms, then reloads Deskflow to escape `macbook`.
+        st.deskflow_screen_host = Some("macbook".to_string());
+        assert!(!st.needs_focus_escape_reload("win-desktop", 420));
+        assert!(st.needs_focus_escape_reload("win-desktop", 920));
     }
 }

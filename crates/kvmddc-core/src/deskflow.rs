@@ -163,19 +163,18 @@ pub fn generate_server_conf(
 
     for host in &enabled {
         if let Some(fkey) = internal_switch_key_for_slot(host.hotkey_slot) {
-            out.push_str(&format!("\tkeystroke({fkey}) = switchToScreen({})\n", host.id));
-            out.push_str(&format!(
-                "\tkeystroke(Control+{fkey}) = switchToScreen({})\n",
-                host.id
-            ));
-            out.push_str(&format!(
-                "\tkeystroke(Control+Alt+{fkey}) = switchToScreen({})\n",
-                host.id
-            ));
-            out.push_str(&format!(
-                "\tkeystroke(Control+Super+{fkey}) = switchToScreen({})\n",
-                host.id
-            ));
+            for chord in [
+                fkey.to_string(),
+                format!("Control+{fkey}"),
+                format!("Alt+{fkey}"),
+                format!("Super+{fkey}"),
+                format!("Shift+{fkey}"),
+                format!("Control+Alt+{fkey}"),
+                format!("Control+Super+{fkey}"),
+                format!("Control+Shift+{fkey}"),
+            ] {
+                out.push_str(&format!("\tkeystroke({chord}) = switchToScreen({})\n", host.id));
+            }
         }
     }
     out.push_str("end\n");

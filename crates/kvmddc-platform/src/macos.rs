@@ -25,6 +25,7 @@ type CGDirectDisplayID = u32;
 
 const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 const K_IO_REGISTRY_ITERATE_RECURSIVELY: u32 = 0x0000_0001;
+const K_CG_EVENT_SOURCE_STATE_PRIVATE: i32 = -1;
 const K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE: i32 = 1;
 const K_CG_HID_EVENT_TAP: u32 = 0;
 
@@ -149,6 +150,7 @@ extern "C" {
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
+    fn CGEventSourceCreate(state_id: i32) -> *mut c_void;
     fn CGEventCreate(source: *const c_void) -> CGEventRef;
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
     fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
@@ -1361,19 +1363,40 @@ pub fn trigger_internal_deskflow_slot(slot: u8) -> Result<()> {
         _ => bail!("不支持的内部切屏槽位: {slot}"),
     };
     unsafe {
-        let down = CGEventCreateKeyboardEvent(std::ptr::null(), keycode, true);
-        ensure!(!down.is_null(), "创建键盘按下事件失败");
+        let priv_src = CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_PRIVATE);
+        let src_ptr = if priv_src.is_null() {
+            std::ptr::null()
+        } else {
+            priv_src as *const c_void
+        };
+
+        let down = CGEventCreateKeyboardEvent(src_ptr, keycode, true);
+        if down.is_null() {
+            if !priv_src.is_null() {
+                CFRelease(priv_src as CFTypeRef);
+            }
+            bail!("创建键盘按下事件失败");
+        }
         CGEventSetFlags(down, 0);
         CGEventPost(K_CG_HID_EVENT_TAP, down);
         CFRelease(down as CFTypeRef);
 
         thread::sleep(Duration::from_millis(15));
 
-        let up = CGEventCreateKeyboardEvent(std::ptr::null(), keycode, false);
-        ensure!(!up.is_null(), "创建键盘抬起事件失败");
+        let up = CGEventCreateKeyboardEvent(src_ptr, keycode, false);
+        if up.is_null() {
+            if !priv_src.is_null() {
+                CFRelease(priv_src as CFTypeRef);
+            }
+            bail!("创建键盘抬起事件失败");
+        }
         CGEventSetFlags(up, 0);
         CGEventPost(K_CG_HID_EVENT_TAP, up);
         CFRelease(up as CFTypeRef);
+
+        if !priv_src.is_null() {
+            CFRelease(priv_src as CFTypeRef);
+        }
     }
     Ok(())
 }
@@ -1400,8 +1423,8 @@ pub fn is_remote_session_active() -> bool {
         .map(|out| {
             let text = String::from_utf8_lossy(&out.stdout);
             text.contains("UURemote Disable Display Sleep")
-                || text.contains("screensharingd")
-                || text.contains("RFBRegisterMDNSService")
+                || text.contains("Remote user is connected")
+                || text.contains("Remote user active")
         })
         .unwrap_or(false);
 
@@ -1481,6 +1504,7 @@ pub fn read_clipboard_png() -> Option<Vec<u8>> {
     unsafe {
         type Msg0 = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
         type Msg1 = unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void) -> *mut c_void;
+        type MsgBool1 = unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_void) -> u8;
         type MsgCount = unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize;
         type MsgLen = unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize;
         type MsgRepPng = unsafe extern "C" fn(
@@ -1492,6 +1516,7 @@ pub fn read_clipboard_png() -> Option<Vec<u8>> {
 
         let send0: Msg0 = std::mem::transmute(objc_msgSend as *const ());
         let send1: Msg1 = std::mem::transmute(objc_msgSend as *const ());
+        let send_bool1: MsgBool1 = std::mem::transmute(objc_msgSend as *const ());
         let send_count: MsgCount = std::mem::transmute(objc_msgSend as *const ());
         let send_len: MsgLen = std::mem::transmute(objc_msgSend as *const ());
         let send_rep_png: MsgRepPng = std::mem::transmute(objc_msgSend as *const ());
@@ -1513,16 +1538,41 @@ pub fn read_clipboard_png() -> Option<Vec<u8>> {
         }
         LAST_PASTEBOARD_CHANGE_COUNT.store(cur_count, Ordering::Relaxed);
 
+        // Inspect advertised UTI list BEFORE calling `dataForType:`.
+        // Never materialize Apple Universal Clipboard (`com.apple.is-remote-clipboard`) items in
+        // background polling — stalled Continuity/AWDL transfers otherwise deadlock `pboard` inside
+        // `-[_CFRemotePasteboardCache prepareDataForItemIdentifier:flavor:]`.
+        let sel_types = sel_registerName(b"types\0".as_ptr() as *const c_char);
+        let types = send0(pb, sel_types);
+        if types.is_null() {
+            return None;
+        }
+        let sel_contains = sel_registerName(b"containsObject:\0".as_ptr() as *const c_char);
+        let cf_remote = make_cfstring(b"com.apple.is-remote-clipboard\0").ok()?;
+        if send_bool1(types, sel_contains, cf_remote.0) != 0 {
+            return None;
+        }
+
+        let cf_png = make_cfstring(b"public.png\0").ok()?;
+        let cf_tiff = make_cfstring(b"public.tiff\0").ok()?;
+        let has_png = send_bool1(types, sel_contains, cf_png.0) != 0;
+        let has_tiff = send_bool1(types, sel_contains, cf_tiff.0) != 0;
+        if !has_png && !has_tiff {
+            return None;
+        }
+
         let sel_data_for = sel_registerName(b"dataForType:\0".as_ptr() as *const c_char);
         let sel_bytes = sel_registerName(b"bytes\0".as_ptr() as *const c_char);
         let sel_length = sel_registerName(b"length\0".as_ptr() as *const c_char);
 
-        let cf_png = make_cfstring(b"public.png\0").ok()?;
-        let mut ns_data = send1(pb, sel_data_for, cf_png.0);
+        let mut ns_data = if has_png {
+            send1(pb, sel_data_for, cf_png.0)
+        } else {
+            std::ptr::null_mut()
+        };
 
         // Fallback: if clipboard holds public.tiff (e.g. certain macOS screenshot tools), convert to PNG
-        if ns_data.is_null() {
-            let cf_tiff = make_cfstring(b"public.tiff\0").ok()?;
+        if ns_data.is_null() && has_tiff {
             let tiff_data = send1(pb, sel_data_for, cf_tiff.0);
             if !tiff_data.is_null() {
                 let cls_rep = objc_getClass(b"NSBitmapImageRep\0".as_ptr() as *const c_char);

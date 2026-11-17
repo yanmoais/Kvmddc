@@ -291,6 +291,87 @@ static CGError shim_CGWarpMouseCursorPosition(CGPoint newCursorPosition) {
     return CGWarpMouseCursorPosition(newCursorPosition);
 }
 
+static inline bool is_internal_kvmddc_slot_keycode(int64_t keycode) {
+    // 0x4F = kVK_F18 (slot 1), 0x50 = kVK_F19 (slot 2), 0x5A = kVK_F20 (slot 3)
+    return keycode == 0x4F || keycode == 0x50 || keycode == 0x5A;
+}
+
+static CGEventFlags shim_CGEventGetFlags(CGEventRef event) {
+    if (event != NULL) {
+        CGEventType ev_type = CGEventGetType(event);
+        if (ev_type == kCGEventKeyDown || ev_type == kCGEventKeyUp) {
+            int64_t keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+            if (is_internal_kvmddc_slot_keycode(keycode)) {
+                return (CGEventFlags)0;
+            }
+        }
+    }
+    return CGEventGetFlags(event);
+}
+
+typedef struct {
+    atomic_uintptr_t tap_port;
+    CGEventTapCallBack orig_cb;
+    void *orig_user_info;
+} shim_tap_ctx_t;
+
+static CGEventRef shim_event_tap_callback(
+    CGEventTapProxy proxy,
+    CGEventType type,
+    CGEventRef event,
+    void *user_info
+) {
+    shim_tap_ctx_t *ctx = (shim_tap_ctx_t *)user_info;
+    if (ctx == NULL || ctx->orig_cb == NULL) {
+        return event;
+    }
+    if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        CFMachPortRef port = (CFMachPortRef)atomic_load(&ctx->tap_port);
+        if (port != NULL) {
+            CGEventTapEnable(port, true);
+        }
+    } else if ((type == kCGEventKeyDown || type == kCGEventKeyUp) && event != NULL) {
+        int64_t keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+        if (is_internal_kvmddc_slot_keycode(keycode)) {
+            CGEventSetFlags(event, (CGEventFlags)0);
+        }
+    }
+    return ctx->orig_cb(proxy, type, event, ctx->orig_user_info);
+}
+
+static CFMachPortRef shim_CGEventTapCreate(
+    CGEventTapLocation tap,
+    CGEventTapPlacement place,
+    CGEventTapOptions options,
+    CGEventMask eventsOfInterest,
+    CGEventTapCallBack callback,
+    void *userInfo
+) {
+    if (callback == NULL) {
+        return CGEventTapCreate(tap, place, options, eventsOfInterest, callback, userInfo);
+    }
+    shim_tap_ctx_t *ctx = (shim_tap_ctx_t *)calloc(1, sizeof(shim_tap_ctx_t));
+    if (ctx == NULL) {
+        return CGEventTapCreate(tap, place, options, eventsOfInterest, callback, userInfo);
+    }
+    ctx->orig_cb = callback;
+    ctx->orig_user_info = userInfo;
+    CFMachPortRef port = CGEventTapCreate(
+        tap,
+        place,
+        options,
+        eventsOfInterest,
+        shim_event_tap_callback,
+        ctx
+    );
+    if (port == NULL) {
+        free(ctx);
+        return NULL;
+    }
+    atomic_store(&ctx->tap_port, (uintptr_t)port);
+    return port;
+}
+
 static void tune_low_latency_tcp_socket(int fd) {
     if (fd < 0) {
         return;
@@ -385,6 +466,8 @@ static const dyld_interpose_tuple interposers[] = {
     { (const void *)shim_CGGetActiveDisplayList, (const void *)CGGetActiveDisplayList },
     { (const void *)shim_CGGetDisplaysWithPoint, (const void *)CGGetDisplaysWithPoint },
     { (const void *)shim_CGWarpMouseCursorPosition, (const void *)CGWarpMouseCursorPosition },
+    { (const void *)shim_CGEventGetFlags, (const void *)CGEventGetFlags },
+    { (const void *)shim_CGEventTapCreate, (const void *)CGEventTapCreate },
     { (const void *)shim_socket, (const void *)socket },
     { (const void *)shim_setsockopt, (const void *)setsockopt },
     { (const void *)shim_accept, (const void *)accept },
